@@ -2,6 +2,7 @@
 import React, { useState, useCallback, useRef, useMemo } from 'react';
 import { ClipboardList, History, Search, User, Calendar, Star, ShieldCheck, Zap, Activity, Download, Upload } from 'lucide-react';
 import { generateGame, generatePatientSuggestion, PatientSuggestion } from './services/geminiService';
+import { proposeMechanic, MechanicProposal } from './services/mechanicProposer';
 import { generateImage } from './services/imageService';
 import { GameConfig, PressureData, SavedPrescription, SessionMetrics, Patient } from './types';
 import GameView from './components/GameView';
@@ -9,6 +10,7 @@ import SummaryView from './components/SummaryView';
 import ErrorBoundary from './components/ErrorBoundary';
 import PatientManagementModal from './components/PatientManagementModal';
 import AISuggestionModal from './components/AISuggestionModal';
+import PlayProposalCard from './components/PlayProposalCard';
 
 const BLE_SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
 const BLE_CHARACTERISTIC_UUID = '0000fff2-0000-1000-8000-00805f9b34fb';
@@ -125,6 +127,11 @@ const App: React.FC = () => {
   const [loadingSuggestion, setLoadingSuggestion] = useState(false);
   const [generationPatientName, setGenerationPatientName] = useState<string | null>(null);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'info' } | null>(null);
+  const [proposal, setProposal] = useState<MechanicProposal | null>(null);
+  const [proposing, setProposing] = useState(false);
+  // 確認提案後的遊戲時長(秒);timer 到時 GameView 自動觸發 onSessionEnd。
+  // null 代表沒有計時器(舊流程或未設定),GameView 內部會視為無限時長。
+  const [sessionDurationSeconds, setSessionDurationSeconds] = useState<number | null>(null);
 
   const showToast = (message: string, type: 'success' | 'info' = 'success') => {
     setToast({ message, type });
@@ -771,8 +778,46 @@ const App: React.FC = () => {
   };
 
 
+  // Stage 1: 機制提案。照護師按「生成遊戲」會先進入這一步,顯示確認卡。
   const handleGenerateGame = async () => {
     if (!prompt.trim()) return;
+    if (proposing || loading) return;
+    setProposing(true);
+    try {
+      const result = await proposeMechanic(prompt);
+      setProposal(result);
+    } catch (err: any) {
+      console.error("Mechanic proposal error:", err);
+      alert('玩法分析失敗：' + err.message);
+    } finally {
+      setProposing(false);
+    }
+  };
+
+  // Stage 1 → 重新提案(同一段描述再叫一次 AI)
+  const handleRegenerateProposal = async () => {
+    if (!prompt.trim()) return;
+    setProposing(true);
+    try {
+      const result = await proposeMechanic(prompt);
+      setProposal(result);
+    } catch (err: any) {
+      console.error("Mechanic re-proposal error:", err);
+      alert('玩法分析失敗：' + err.message);
+    } finally {
+      setProposing(false);
+    }
+  };
+
+  // Stage 1 → 改一下描述(關卡片,讓使用者回到輸入框)
+  const handleEditPrompt = () => {
+    setProposal(null);
+  };
+
+  // Stage 2: 確認提案後實際生成遊戲。
+  const handleConfirmProposal = async (p: MechanicProposal) => {
+    setProposal(null);
+    setSessionDurationSeconds(p.recommended_duration_seconds);
     setLoading(true);
     setIsGameActive(false);
     setSessionMetrics(null);
@@ -782,9 +827,14 @@ const App: React.FC = () => {
 
     const advicePatientName = selectedPatient?.name || '玩家';
     const enhancedPrompt = `受訓者姓名為「${advicePatientName}」。請依據此姓名產出個人化建議。需求：${prompt}`;
+    const confirmedMechanic = {
+      mechanic_id: p.matched_mechanic_id,
+      activity_theme: p.activity_theme,
+      player_count: p.player_count,
+    };
 
     try {
-      const result = await generateGame(enhancedPrompt, userHistory);
+      const result = await generateGame(enhancedPrompt, userHistory, confirmedMechanic);
       const newConfig = result.config;
       let advice = result.clinicalAdvice;
 
@@ -1022,11 +1072,15 @@ const App: React.FC = () => {
             <div className="flex gap-2 mb-4">
               <button
                 onClick={handleGenerateGame}
-                disabled={loading}
-                className={`flex-1 py-3 rounded-lg font-bold transition-all ${loading ? 'bg-amber-800 text-amber-500 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg'
+                disabled={loading || proposing || !!proposal}
+                className={`flex-1 py-3 rounded-lg font-bold transition-all ${loading || proposing || proposal ? 'bg-amber-800 text-amber-500 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg'
                   }`}
               >
-                {loading ? <span className="loading-dots">生成中</span> : '生成遊戲'}
+                {proposing
+                  ? <span className="loading-dots">分析玩法中</span>
+                  : loading
+                    ? <span className="loading-dots">生成中</span>
+                    : '生成遊戲'}
               </button>
               {loadingSuggestion && (
                 <div className="fixed inset-0 bg-amber-950/60 backdrop-blur-md flex items-center justify-center z-[1000] animate-in fade-in duration-300">
@@ -1248,6 +1302,7 @@ const App: React.FC = () => {
                     patientName={selectedPatient?.name}
                     mvcL={selectedPatient?.daily_mvc_l}
                     mvcR={selectedPatient?.daily_mvc_r}
+                    durationSeconds={sessionDurationSeconds ?? undefined}
                     onSessionEnd={handleSessionEnd}
                   />
                 </ErrorBoundary>
@@ -1548,6 +1603,17 @@ const App: React.FC = () => {
           patientName={selectedPatient.name}
           onAccept={handleAcceptSuggestion}
           onClose={() => setAiSuggestion(null)}
+        />
+      )}
+
+      {/* Stage 1 玩法提案確認卡 */}
+      {proposal && (
+        <PlayProposalCard
+          proposal={proposal}
+          busy={proposing || loading}
+          onConfirm={handleConfirmProposal}
+          onRegenerate={handleRegenerateProposal}
+          onEdit={handleEditPrompt}
         />
       )}
 

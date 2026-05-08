@@ -1,6 +1,7 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
 import { GameConfig } from "../types";
+import { MECHANICS } from "./engineCapabilities";
 
 /**
  * 🤖 AIGrip 遊戲引擎：Gemini 系統指令 (AUGP v1.0)
@@ -127,11 +128,11 @@ const SYSTEM_INSTRUCTION = `你是一位精通「團康活動邏輯」與「物�
 - **格網彈出類** (打地鼠、拍蒼蠅、敲打多孔): 引擎只支援「從上方落下」的 target 軌道,不支援「定點隨機 pop-up」。
 
 ⚠️ **layout / 配置限制(目前引擎能力)**:
-- **1~4 人共用同一條規則**:引擎依 \`sector\` 將螢幕等分為 \`player_count\` 欄(p1 在最左、pN 在最右),\`layout\` 在欄內偏移 ±30% 欄寬。每位玩家「左手 / 右手」各一個 entity 時,設 \`sector: "p{N}"\` + \`layout: "left"\` / \`"right"\`,兩手會自動落在同一欄內的左右兩側,絕不重疊。
-  - **1 人**:p1 中心 50%,left/right = 20%/80%
-  - **2 人**:p1 中心 25%(left/right = 10%/40%);p2 中心 75%(left/right = 60%/90%)
-  - **3 人**:p1 中心 ~16.7%、p2 中心 50%、p3 中心 ~83.3%;每欄內 left/right 各偏移 ±10%
-  - **4 人**:p1 = 12.5%、p2 = 37.5%、p3 = 62.5%、p4 = 87.5%;每欄內 left/right 各偏移 ±7.5%
+- **1~4 人共用同一條規則**:引擎依 \`sector\` 將螢幕等分為 \`player_count\` 欄(p1 在最左、pN 在最右),\`layout\` 在欄內偏移 ±20% 欄寬。同玩家左右手距離 < 鄰近玩家距離,視覺上每位玩家的兩手會配對在一起。每位玩家「左手 / 右手」各一個 entity 時,設 \`sector: "p{N}"\` + \`layout: "left"\` / \`"right"\`。
+  - **1 人**:p1 中心 50%,left/right = 30%/70%
+  - **2 人**:p1 中心 25%(left/right = 15%/35%);p2 中心 75%(left/right = 65%/85%)
+  - **3 人**:p1 中心 ~16.7%、p2 中心 50%、p3 中心 ~83.3%;每欄內 left/right 各偏移 ±~6.7%
+  - **4 人**:p1 = 12.5%、p2 = 37.5%、p3 = 62.5%、p4 = 87.5%;每欄內 left/right 各偏移 ±5%
 - **shared 實體**(如共用背景、共用 finish_line、雙隊划龍舟的兩條終點線):不被 sector 切欄,直接依 layout 落在 25% / 50% / 75%。划龍舟兩條 finish_line 用 \`sector: "shared"\` + layout left/right 仍是正解。
 - 仍未支援:四角配置(2×2 grid)、上下分排(top row / bottom row)、隨機 grid pop-up。
 
@@ -264,25 +265,83 @@ async function callWithRetry<T>(fn: () => Promise<T>, retries = 5, delay = 2000)
   }
 }
 
-export const generateGame = async (prompt: string, history: any[] = []): Promise<{ config: GameConfig, clinicalAdvice: string }> => {
+/**
+ * Stage 1 提案確認後傳給 Stage 2 的引導資訊。
+ * 有了這個，AI 不需要再猜機制 / 人數，只要根據主題填 entity 細節即可。
+ */
+export interface ConfirmedMechanic {
+  mechanic_id: string;
+  activity_theme: string;
+  player_count: number;
+}
+
+/**
+ * 把 manifest 中該機制的關鍵 spec 渲染成 prompt 片段，
+ * 直接告訴 AI:「不用猜了,就用這個機制」。
+ */
+const renderConfirmedMechanicGuide = (cm: ConfirmedMechanic): string => {
+  const spec = MECHANICS.find((m) => m.id === cm.mechanic_id);
+  if (!spec) return "";
+
+  const features = spec.engine_features.map((f) => `   - ${f}`).join("\n");
+  const canonicalEntities = "canonical_entities" in spec
+    ? `\n\n## 建議起手 entity 配置(可調整 id 名稱以配合主題,但 type/role/sector/layout/ball_binding 應保留):\n\`\`\`json\n${JSON.stringify(spec.canonical_entities, null, 2)}\n\`\`\``
+    : "";
+  const requiredMeta = "requires_metadata" in spec && spec.requires_metadata.length > 0
+    ? `\n\n## 必填 metadata: ${spec.requires_metadata.join(", ")}`
+    : "";
+  const interactionType = "interaction_type" in spec
+    ? spec.interaction_type
+    : (spec as any).interaction_type_options?.[0];
+
+  return `
+## 🎯 [使用者已確認玩法] 請嚴格遵守以下設定
+
+- **機制 ID**: \`${spec.id}\` (${spec.name})
+- **interaction_type**: \`${interactionType}\`
+- **player_count**: \`${cm.player_count}\`
+- **活動主題**: ${cm.activity_theme}
+
+## 機制玩法概念
+${spec.mechanic_summary}
+
+## 引擎特性(必須遵守)
+${features}${requiredMeta}${canonicalEntities}
+
+## 注意
+- 不要選擇其他 interaction_type 或機制,使用者已確認用這個。
+- entity 視覺/命名請配合「${cm.activity_theme}」主題包裝(例如機制是 TEAM_COOP_RACE 主題是「推火箭到月球」,id 可命名為 rocket_team_a / moon_finish_a 等)。
+- prescription_summary 要把活動主題自然帶入,讓使用者一看就知道這是「${cm.activity_theme}」這個遊戲。
+`;
+};
+
+export const generateGame = async (
+  prompt: string,
+  history: any[] = [],
+  confirmedMechanic?: ConfirmedMechanic,
+): Promise<{ config: GameConfig, clinicalAdvice: string }> => {
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("Missing VITE_GEMINI_API_KEY in environment variables");
   }
   const ai = new GoogleGenAI({ apiKey });
 
-  const historyContext = history.length > 0 
-    ? `\n玩家歷史表現：${JSON.stringify(history.slice(0, 3))}` 
+  const historyContext = history.length > 0
+    ? `\n玩家歷史表現：${JSON.stringify(history.slice(0, 3))}`
     : "\n新玩家首次訓練。";
+
+  const mechanicGuide = confirmedMechanic
+    ? renderConfirmedMechanicGuide(confirmedMechanic)
+    : "";
 
   const generate = () => ai.models.generateContent({
     model: "gemini-2.5-flash",
-    contents: `請設計復健任務：${prompt}\n${historyContext}`,
+    contents: `請設計復健任務：${prompt}\n${historyContext}${mechanicGuide}`,
     config: {
       systemInstruction: SYSTEM_INSTRUCTION,
       responseMimeType: "application/json",
       responseSchema: responseSchema,
-      temperature: 0.7,
+      temperature: confirmedMechanic ? 0.4 : 0.7, // 已確認機制時降溫,求穩定
     },
   });
 

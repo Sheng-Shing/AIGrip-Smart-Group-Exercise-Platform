@@ -12,6 +12,8 @@ interface GameViewProps {
   isActive: boolean;
   mvcL?: number;
   mvcR?: number;
+  /** 遊戲時長(秒)。timer 到時自動觸發 onSessionEnd。undefined 代表無限時長(舊流程)。 */
+  durationSeconds?: number;
   onSessionEnd: (metrics: SessionMetrics) => void;
 }
 
@@ -93,8 +95,10 @@ const getEntitySector = (ent: EntLike): Sector => {
 };
 
 // 依玩家人數動態決定 X 位置:
-// - 1~4 人: sector 將螢幕等分為 N 欄(p1 最左、pN 最右), layout 在欄內偏移 ±30% 欄寬。
-//   1P → 1 欄(整個畫面),left/right 落在 20%/80%。
+// - 1~4 人: sector 將螢幕等分為 N 欄(p1 最左、pN 最右), layout 在欄內偏移 ±20% 欄寬。
+//   選用 0.2 而非 0.3 是為了讓「同玩家左右手 (intra-column)」距離 < 「鄰近玩家 (inter-column)」距離,
+//   視覺上每位玩家的兩支槌子會配對在一起,不會跟鄰居錯位成群。
+//   1P → 1 欄(整個畫面),left/right 落在 30%/70%。
 // - sector === 'shared' 或無法解析時:layout 直接對應 25%/50%/75%(舊版 fallback)。
 const getLayoutX = (ent: EntLike, screenW: number, playerCount: number = 1): number => {
   const layout = getEntityLayout(ent);
@@ -107,8 +111,8 @@ const getLayoutX = (ent: EntLike, screenW: number, playerCount: number = 1): num
       if (idx >= 0 && idx < playerCount) {
         const colWidth = screenW / playerCount;
         const colCenter = colWidth * (idx + 0.5);
-        if (layout === 'left') return colCenter - colWidth * 0.3;
-        if (layout === 'right') return colCenter + colWidth * 0.3;
+        if (layout === 'left') return colCenter - colWidth * 0.2;
+        if (layout === 'right') return colCenter + colWidth * 0.2;
         return colCenter;
       }
     }
@@ -146,9 +150,9 @@ const collectClinicalTags = (cfg: GameConfig | undefined | null): string[] => {
   return Array.from(set);
 };
 
-const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActive, patientName, mvcL = 1.0, mvcR = 1.0, onSessionEnd }) => {
+const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActive, patientName, mvcL = 1.0, mvcR = 1.0, durationSeconds, onSessionEnd }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const stateRef = useRef({ config, pressure, pressures, isActive });
+  const stateRef = useRef({ config, pressure, pressures, isActive, durationSeconds });
   const appRef = useRef<PIXI.Application | null>(null);
   const sessionContainerRef = useRef<PIXI.Container | null>(null);
   const entitiesRef = useRef<{ [id: string]: PIXI.Container }>({});
@@ -212,8 +216,8 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
   const entranceCompleteRef = useRef<boolean>(false);
 
   useEffect(() => {
-    stateRef.current = { config, pressure, pressures, isActive };
-  }, [config, pressure, pressures, isActive]);
+    stateRef.current = { config, pressure, pressures, isActive, durationSeconds };
+  }, [config, pressure, pressures, isActive, durationSeconds]);
 
   useEffect(() => {
     if (isActive) {
@@ -411,7 +415,13 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
            const pawnColor = isMixedMode
              ? MIXED_PAWN_COLORS[getPawnPlayerSlot(ent)]
              : 0x00BFFF;
-           shape.roundRect(-75, -20, 150, 40, 20);
+           // 球板寬度依玩家人數縮放,避免 4 人各帶左右手時兩支同欄槌子在窄欄寬下視覺重疊。
+           // 同欄左右手距離 = 螢幕寬 / player_count × 0.6,paddle 寬須小於這個距離才不重疊。
+           const playerCount = cfg.metadata.player_count ?? 1;
+           const paddleWidth = playerCount >= 4 ? 110
+                             : playerCount >= 3 ? 130
+                             : 150;
+           shape.roundRect(-paddleWidth / 2, -20, paddleWidth, 40, 20);
            shape.fill({ color: pawnColor, alpha });
            shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
         } else if (ent.type === 'obstacle' || role === 'obstacle') {
@@ -514,6 +524,19 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
       instructionTextRef.current.text = instructionStr;
       instructionTextRef.current.x = app.screen.width / 2;
       instructionTextRef.current.y = 10;
+
+      // 倒數計時文字(右上角),只在有 durationSeconds 時顯示
+      if (!timerTextRef.current) {
+        timerTextRef.current = new PIXI.Text({
+          text: "",
+          style: { fill: 0xffffff, fontSize: 22, fontWeight: 'bold' },
+        });
+        timerTextRef.current.anchor.set(1, 0); // 右上對齊
+        sessionContainerRef.current.addChild(timerTextRef.current);
+      }
+      timerTextRef.current.x = app.screen.width - 16;
+      timerTextRef.current.y = 10;
+      timerTextRef.current.visible = !!durationSeconds;
       
       // Sequence Bulbs UI — 先清除上一次的 bulb container 避免疊加
       if (sequenceBulbContainerRef.current) {
@@ -616,7 +639,7 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
       }
 
       const tickerCb = () => {
-        const { config: cfg, pressure: prs, pressures: allPrs, isActive: active } = stateRef.current;
+        const { config: cfg, pressure: prs, pressures: allPrs, isActive: active, durationSeconds: dur } = stateRef.current;
         if (!sessionContainerRef.current || !app) return;
 
         const isCalibration = cfg.metadata.game_id === 'calibration';
@@ -632,6 +655,42 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
         // 入場期間暫停物理與計分，讓 GSAP 動畫順暢、長輩有預備時間
         if (!entranceCompleteRef.current) {
             return;
+        }
+
+        // --- 倒數計時 ---
+        if (dur && dur > 0 && !sessionEndedRef.current) {
+            const elapsedSec = (performance.now() - sessionStartTimeRef.current) / 1000;
+            const remainingSec = Math.max(0, dur - elapsedSec);
+
+            if (timerTextRef.current) {
+                const m = Math.floor(remainingSec / 60);
+                const s = Math.floor(remainingSec % 60);
+                timerTextRef.current.text = `⏱ ${m}:${s.toString().padStart(2, '0')}`;
+                // 最後 10 秒紅色警示
+                timerTextRef.current.style.fill = remainingSec <= 10 ? 0xff5555 : 0xffffff;
+            }
+
+            if (remainingSec <= 0) {
+                // 時間到 → 觸發 session end(同 GAME_WIN 流程)
+                if (instructionTextRef.current) {
+                    instructionTextRef.current.text = `⏱ 時間到!最終分數: ${scoreRefs.current.global}`;
+                }
+                sessionEndedRef.current = false;
+                const totalDuration = (performance.now() - sessionStartTimeRef.current) / 1000;
+                onSessionEnd({
+                    effectiveSeconds: totalEffectiveMSRef.current / 1000,
+                    totalSeconds: totalDuration,
+                    avgPressureL: totalPressureLRef.current / Math.max(1, totalSamplesRef.current),
+                    avgPressureR: totalPressureRRef.current / Math.max(1, totalSamplesRef.current),
+                    maxPressure: maxPressureRef.current,
+                    maxPressureL: maxPressureLRef.current,
+                    maxPressureR: maxPressureRRef.current,
+                    compensationOccurred: false,
+                    clinical_tags: collectClinicalTags(cfg),
+                });
+                sessionEndedRef.current = true;
+                return;
+            }
         }
 
         // Data Collection
@@ -917,8 +976,10 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                      // Require Reset Logic for Burst
                      if (actVal > threshold && !phys.hasFired) {
                          phys.hasFired = true;
-                         // overwrite + onComplete 強制收斂回 (1,1),避免連發 PULSE 動畫疊加導致 scale 漂移
+                         // overwrite + onComplete 強制收斂回 (1,1)。額外預先 reset 一次,避免上一輪 onComplete
+                         // 被 killTweensOf 切掉時 scale 卡在 2.0 不還原。
                          gsap.killTweensOf(container.scale);
+                         container.scale.set(1, 1);
                          gsap.to(container.scale, {
                              x: 2.0, y: 2.0, duration: 0.15, yoyo: true, repeat: 1,
                              overwrite: 'auto',
@@ -948,6 +1009,7 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                                  const otherC = entitiesRef.current[otherEnt.id];
                                  if (otherC) {
                                      gsap.killTweensOf(otherC.scale);
+                                     otherC.scale.set(1, 1); // 預先 reset,避免上輪 onComplete 被切掉時鼓卡在 1.3
                                      gsap.to(otherC.scale, {
                                          x: 1.3, y: 1.3, duration: 0.1, yoyo: true, repeat: 1,
                                          overwrite: 'auto',
@@ -1015,9 +1077,18 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                          const lay = getEntityLayout(ent);
                          if (lay === 'left' || lay === 'right') {
                              const sync = taikoSyncRef.current;
-                             // 本拍被擊中過 → 隱藏(下一拍重置時 consumedThisBeat 會 clear)
-                             if (sync.consumedThisBeat.has(ent.id)) {
+                             // 被 PULSE 衝量擊中後 vy < 0,讓物理迴圈處理彈跳(向上飛 + 重力落回),不鎖 Y。
+                             // 待 vy 回正(衝量耗盡)後,若已標記 consumedThisBeat 才隱藏;否則回歸同步落下。
+                             const isBouncing = phys.vy !== undefined && phys.vy < 0;
+                             if (isBouncing) {
+                                 container.visible = true;
+                                 // X 仍鎖在欄位,Y 留給下方 fall logic 處理(套重力後會自然落回 baseFallSpeed)
+                                 container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+                                 // 不 continue,讓下方等速下墜邏輯接管 vy 與 phys.lastY
+                             } else if (sync.consumedThisBeat.has(ent.id)) {
+                                 // 本拍已擊中且彈跳結束 → 隱藏(下一拍重置時 consumedThisBeat 會 clear)
                                  container.visible = false;
+                                 continue;
                              } else {
                                  container.visible = true;
                                  const groupY = lay === 'left' ? sync.leftY : sync.rightY;
@@ -1025,8 +1096,8 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                                  phys.vy = 0;
                                  container.y = groupY;
                                  container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+                                 continue;
                              }
-                             continue;
                          }
                      }
 
@@ -1267,6 +1338,17 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                    const maxHand = Math.max(pickerPrs.left, pickerPrs.right);
                    if (maxHand < 0.2) {
                        return; // 若雙手都未達門檻，視為沒接，香菇穿透不觸發碰撞。
+                   }
+               }
+
+               // --- PULSE-mode paddle 必須處於「已擊發」狀態才算碰撞 ---
+               // 不擋的話,鼓自然落到槌子位置就會觸發 SCORE_HIT(球都不握分數也增加)。
+               // phys.hasFired 由 PULSE 分支管理:壓力 > 0.6 設 true,< 0.15 重置為 false。
+               if (pawnEnt && getEntityRole(pawnEnt) === 'paddle' &&
+                   cfg.metadata.interaction_type === 'PULSE') {
+                   const pawnPhys = entityPhysicsRef.current[pawnEnt.id];
+                   if (!pawnPhys?.hasFired) {
+                       return; // 槌子沒按下 → 鼓飄過去不算擊中
                    }
                }
 
