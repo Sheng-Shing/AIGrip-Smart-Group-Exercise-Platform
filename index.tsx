@@ -14,3 +14,7 @@ root.render(
     <App />
   </React.StrictMode>
 );
+
+requestAnimationFrame(() => {
+  document.body.style.visibility = 'visible';
+});

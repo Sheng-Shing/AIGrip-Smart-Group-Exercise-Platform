@@ -1,30 +1,28 @@
-
 import React, { useEffect, useRef } from 'react';
 import * as PIXI from 'pixi.js';
 import gsap from 'gsap';
-import { GameConfig, PressureData, GameAction, GameMode, SessionMetrics } from '../types';
+import { OutlineFilter } from 'pixi-filters';
+import { GameConfig, SessionMetrics, PressureData, Entity, EntityRole, LayoutHint, Sector } from '../types';
 
 interface GameViewProps {
+  patientName?: string;
   config: GameConfig;
   pressure: PressureData;
+  pressures?: Record<string, PressureData>;
   isActive: boolean;
+  mvcL?: number;
+  mvcR?: number;
   onSessionEnd: (metrics: SessionMetrics) => void;
 }
 
-// 使用 globalThis 確保跨模組、跨重新渲染的唯一性
 const PIXI_GLOBAL_KEY = '__HOLOBALL_PIXI_APP__';
 const PIXI_INIT_KEY = '__HOLOBALL_PIXI_INIT_PROMISE__';
 
 const getOrInitApp = async (): Promise<PIXI.Application> => {
   const g = globalThis as any;
-
-  if (g[PIXI_INIT_KEY]) {
-    return g[PIXI_INIT_KEY];
-  }
-
+  if (g[PIXI_INIT_KEY]) return g[PIXI_INIT_KEY];
   const app = new PIXI.Application();
   g[PIXI_GLOBAL_KEY] = app;
-
   g[PIXI_INIT_KEY] = app.init({
     antialias: true,
     autoDensity: true,
@@ -32,66 +30,295 @@ const getOrInitApp = async (): Promise<PIXI.Application> => {
     resolution: window.devicePixelRatio || 1,
     hello: false,
   }).then(() => app);
-
   return g[PIXI_INIT_KEY];
 };
 
-const parseColor = (c: string) => {
+const parseColor = (c?: string) => {
   if (!c) return 0xffffff;
   const hex = c.replace(/^0x|^#/, '');
   return parseInt(hex, 16) || 0xffffff;
 };
 
-const GameView: React.FC<GameViewProps> = ({ config, pressure, isActive, onSessionEnd }) => {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const stateRef = useRef({ config, pressure, isActive });
-  const sessionContainerRef = useRef<PIXI.Container | null>(null);
-  const leftTargetRef = useRef<PIXI.Container | null>(null);
-  const rightTargetRef = useRef<PIXI.Container | null>(null);
-  const feedbackContainerRef = useRef<PIXI.Container | null>(null);
-  const lastPulseTriggerRef = useRef<number>(0);
-  const balanceLineRef = useRef<PIXI.Graphics | null>(null);
-  const targetZoneRef = useRef<PIXI.Graphics | null>(null);
-  const backgroundSpriteRef = useRef<PIXI.Sprite | null>(null);
-  const maintenanceTimerRef = useRef<number>(0);
-  const leftMaintenanceTimerRef = useRef<number>(0);
-  const rightMaintenanceTimerRef = useRef<number>(0);
-  const completedCountsRef = useRef<number>(0);
-  const leftProgressRingRef = useRef<PIXI.Graphics | null>(null);
-  const rightProgressRingRef = useRef<PIXI.Graphics | null>(null);
-  const mainTargetOriginalColorRef = useRef<number>(0xffffff);
-  const instructionTextRef = useRef<PIXI.Text | null>(null);
-  const compensationWarningRef = useRef<PIXI.Text | null>(null);
-  const leftScoreRef = useRef<number>(0);
-  const rightScoreRef = useRef<number>(0);
-  const leftScoreTextRef = useRef<PIXI.Text | null>(null);
-  const rightScoreTextRef = useRef<PIXI.Text | null>(null);
-  const rhythmTargetSideRef = useRef<'left' | 'right' | null>(null);
-  const rhythmNextTargetTimeRef = useRef<number>(0);
-  const rhythmErrorTextRef = useRef<PIXI.Text | null>(0 as any);
-  const rhythmTargetMarkerRef = useRef<PIXI.Graphics | null>(null);
-  const independentTimerRef = useRef<number>(0);
-  const difficultyTextRef = useRef<PIXI.Text | null>(null);
-  const hasScoredRef = useRef<boolean>(false);
-  const diffWarningTextRef = useRef<PIXI.Text | null>(null);
-  const breathingBallRef = useRef<PIXI.Graphics | null>(null);
-  const breathingBallOuterRef = useRef<PIXI.Graphics | null>(null);
-  const maxPressureRef = useRef<number>(0);
+// MIXED-mode paddle layout: P1 top / P2 bottom, distinct colors
+const MIXED_PAWN_COLORS: Record<number, number> = { 1: 0x00BFFF, 2: 0xFF8C00 };
+const MIXED_BALL_COLORS = { blue: 0x00BFFF, orange: 0xFF8C00 } as const;
+type MixedBallColor = keyof typeof MIXED_BALL_COLORS;
+const pawnSlotToBallColor = (slot: 1 | 2): MixedBallColor => (slot === 1 ? 'blue' : 'orange');
+const flipBallColor = (c: MixedBallColor): MixedBallColor => (c === 'blue' ? 'orange' : 'blue');
+const randomFallVx = () => (150 + Math.random() * 200) * (Math.random() > 0.5 ? 1 : -1);
 
-  // 同步狀態到 Ref 避免 Ticker 閉包問題
+// === Semantic field readers (with legacy id-string fallback) ===
+type EntLike = { id: string; type?: string; role?: EntityRole; layout?: LayoutHint; sector?: Sector; ball_binding?: string };
+
+const getEntityRole = (ent: EntLike): EntityRole => {
+  if (ent.role) return ent.role;
+  // legacy fallback for stored prescriptions
+  if (ent.id.includes('hole') && ent.id.includes('target')) return 'mushroom';
+  if (ent.id.includes('picker')) return 'basket';
+  if (ent.type === 'controllable_pawn') return 'paddle';
+  if (ent.type === 'target') return 'mushroom';
+  if (ent.type === 'obstacle') return 'obstacle';
+  return 'decoration';
+};
+
+const getEntityLayout = (ent: EntLike): LayoutHint => {
+  if (ent.layout) return ent.layout;
+  if (ent.id.includes('left')) return 'left';
+  if (ent.id.includes('right')) return 'right';
+  return 'center';
+};
+
+const getEntitySector = (ent: EntLike): Sector => {
+  if (ent.sector) return ent.sector;
+  const b = ent.ball_binding;
+  // 新格式 p{N}_{left|right|both} 取 N
+  const m = b?.match(/^p(\d+)_/);
+  if (m) {
+    const idx = parseInt(m[1], 10);
+    if (idx === 1) return 'p1';
+    if (idx === 2) return 'p2';
+    if (idx === 3) return 'p3';
+    if (idx === 4) return 'p4';
+  }
+  // 舊格式: ball_N / p{N} / player_N
+  const legacy = b?.match(/^(?:ball|p|player)_?(\d+)$/);
+  if (legacy) {
+    const idx = parseInt(legacy[1], 10);
+    if (idx === 1) return 'p1';
+    if (idx === 2) return 'p2';
+    if (idx === 3) return 'p3';
+    if (idx === 4) return 'p4';
+  }
+  return 'shared';
+};
+
+// 依玩家人數動態決定 X 位置:
+// - 1~4 人: sector 將螢幕等分為 N 欄(p1 最左、pN 最右), layout 在欄內偏移 ±30% 欄寬。
+//   1P → 1 欄(整個畫面),left/right 落在 20%/80%。
+// - sector === 'shared' 或無法解析時:layout 直接對應 25%/50%/75%(舊版 fallback)。
+const getLayoutX = (ent: EntLike, screenW: number, playerCount: number = 1): number => {
+  const layout = getEntityLayout(ent);
+  const sector = getEntitySector(ent);
+
+  if (playerCount >= 1 && sector !== 'shared') {
+    const m = sector.match(/^p(\d+)$/);
+    if (m) {
+      const idx = parseInt(m[1], 10) - 1;
+      if (idx >= 0 && idx < playerCount) {
+        const colWidth = screenW / playerCount;
+        const colCenter = colWidth * (idx + 0.5);
+        if (layout === 'left') return colCenter - colWidth * 0.3;
+        if (layout === 'right') return colCenter + colWidth * 0.3;
+        return colCenter;
+      }
+    }
+  }
+
+  if (layout === 'left') return screenW * 0.25;
+  if (layout === 'right') return screenW * 0.75;
+  return screenW / 2;
+};
+
+const getPawnPlayerSlot = (ent: EntLike): 1 | 2 => {
+  const sector = getEntitySector(ent);
+  if (sector === 'p2') return 2;
+  if (sector === 'p1') return 1;
+  // shared/unset → fallback to layout
+  return getEntityLayout(ent) === 'right' ? 2 : 1;
+};
+
+const getMixedPawnY = (slot: 1 | 2, screenH: number) => screenH * (slot === 1 ? 0.85 : 0.95);
+
+// Linear interpolation — 平滑感測器抖動，符合「度假感」入場
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+// 入場動畫總時長
+const ANTICIPATION_MS = 1500;
+
+// 收集當次 session 訓練到的臨床標籤（去重），供 SessionMetrics 記錄
+const collectClinicalTags = (cfg: GameConfig | undefined | null): string[] => {
+  if (!cfg) return [];
+  const set = new Set<string>();
+  for (const ent of cfg.entities ?? []) {
+    const tag = ent.movement_logic?.clinical_tag;
+    if (tag) set.add(tag);
+  }
+  return Array.from(set);
+};
+
+const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActive, patientName, mvcL = 1.0, mvcR = 1.0, onSessionEnd }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const stateRef = useRef({ config, pressure, pressures, isActive });
+  const appRef = useRef<PIXI.Application | null>(null);
+  const sessionContainerRef = useRef<PIXI.Container | null>(null);
+  const entitiesRef = useRef<{ [id: string]: PIXI.Container }>({});
+  const entityPhysicsRef = useRef<{ [id: string]: { vy: number, lastY: number, hasFired: boolean } }>({});
+  const collisionCooldownRef = useRef<{ [key: string]: number }>({});
+  const ballColorRef = useRef<{ [id: string]: MixedBallColor }>({});
+  const ballScaleRef = useRef<{ [id: string]: number }>({});
+  const backgroundSpriteRef = useRef<PIXI.Sprite | null>(null);
+  const sequenceStepRef = useRef<number>(1);
+  const sequenceBulbsRef = useRef<PIXI.Graphics[]>([]);
+  const sequenceBulbContainerRef = useRef<PIXI.Container | null>(null);
+  const playerZonesRef = useRef<PIXI.Container | null>(null);
+  // 記憶序列：AI 提供的踩踏 pattern，sequenceIndexRef 為當前位置
+  const sequencePatternRef = useRef<number[]>([]);
+  const sequenceIndexRef = useRef<number>(0);
+
+  // 太鼓同步:左/右兩組共用座標,依 pattern 輪流/同時落下形成節拍。
+  // pattern 元素:'left'=只左落、'right'=只右落、'both'=左右一起落
+  // 預設 [L, R, L, R, B] 重複,類似真實鼓點(左右左右然後一拍兩邊一起)。
+  const taikoSyncRef = useRef<{
+    pattern: ('left' | 'right' | 'both')[];
+    patternIndex: number;
+    leftY: number;
+    rightY: number;
+    pauseUntil: number;
+    initialized: boolean;
+    consumedThisBeat: Set<string>; // 本拍已被擊中的 drum id,在本拍剩餘時間內隱藏
+  }>({
+    pattern: ['left', 'right', 'left', 'right', 'both'],
+    patternIndex: 0,
+    leftY: -200,
+    rightY: -200,
+    pauseUntil: 0,
+    initialized: false,
+    consumedThisBeat: new Set(),
+  });
+
+  // Session Tracking
+  const sessionStartTimeRef = useRef<number>(0);
+  const sessionEndedRef = useRef<boolean>(false);
+  const totalEffectiveMSRef = useRef<number>(0);
+  const totalPressureLRef = useRef<number>(0);
+  const totalPressureRRef = useRef<number>(0);
+  const totalSamplesRef = useRef<number>(0);
+  const maxPressureRef = useRef<number>(0);
+  const maxPressureLRef = useRef<number>(0);
+  const maxPressureRRef = useRef<number>(0);
+  const scoreRefs = useRef<{ global: number, p1: number, p2: number, p3: number, p4: number }>({ global: 0, p1: 0, p2: 0, p3: 0, p4: 0 });
+
+  // UI elements
+  const scoreTextRef = useRef<PIXI.Text | null>(null);
+  const instructionTextRef = useRef<PIXI.Text | null>(null);
+  const progressBarRef = useRef<PIXI.Graphics | null>(null);
+  const timerTextRef = useRef<PIXI.Text | null>(null);
+
+  // Ticker reference
+  const tickerCbRef = useRef<(() => void) | null>(null);
+  const applyThemeCountRef = useRef<number>(0);
+
+  // 入場動畫狀態：物理在 entrance 期間暫停，避免 GSAP 動畫被 ticker 蓋掉
+  const entranceCompleteRef = useRef<boolean>(false);
+
   useEffect(() => {
-    stateRef.current = { config, pressure, isActive };
-  }, [config, pressure, isActive]);
+    stateRef.current = { config, pressure, pressures, isActive };
+  }, [config, pressure, pressures, isActive]);
+
+  useEffect(() => {
+    if (isActive) {
+      sessionStartTimeRef.current = performance.now();
+      totalEffectiveMSRef.current = 0;
+      sessionEndedRef.current = false;
+      totalPressureLRef.current = 0;
+      totalPressureRRef.current = 0;
+      totalSamplesRef.current = 0;
+      maxPressureRef.current = 0;
+      maxPressureLRef.current = 0;
+      maxPressureRRef.current = 0;
+      scoreRefs.current = { global: 0, p1: 0, p2: 0, p3: 0, p4: 0 };
+
+      // 重置物理狀態，讓入場動畫從乾淨狀態起跑
+      entityPhysicsRef.current = {};
+      entranceCompleteRef.current = false;
+      playEntranceAnimation();
+    } else {
+      entranceCompleteRef.current = false;
+    }
+  }, [isActive]);
+
+  // 入場動畫：物件從畫面底部緩慢升起，提供視覺追蹤訓練與心理預備時間
+  const playEntranceAnimation = () => {
+    const app = appRef.current;
+    if (!app || !sessionContainerRef.current) {
+      // app 尚未初始化 → 直接放行物理，避免卡住整個 session
+      entranceCompleteRef.current = true;
+      return;
+    }
+    const cfg = stateRef.current.config;
+    if (!cfg) {
+      entranceCompleteRef.current = true;
+      return;
+    }
+
+    const entityIds = Object.keys(entitiesRef.current);
+    if (entityIds.length === 0) {
+      // 尚未建立實體 → 跳過入場
+      entranceCompleteRef.current = true;
+      return;
+    }
+
+    const screenH = app.screen.height;
+    const entryDur = ANTICIPATION_MS / 1000;
+    let maxDelay = 0;
+
+    for (const ent of cfg.entities) {
+      const c = entitiesRef.current[ent.id];
+      if (!c) continue;
+      const role = getEntityRole(ent);
+
+      // 紀錄目標位置，從底部升起到該位置
+      const targetX = c.x;
+      const targetY = (role === 'mushroom' || role === 'obstacle')
+        ? screenH * 0.2  // 升到指示燈下方等待掉落
+        : c.y;           // basket / paddle / decoration 升到原本就位
+
+      const delay = Math.random() * 0.4;
+      maxDelay = Math.max(maxDelay, delay);
+
+      c.x = targetX;
+      c.y = screenH + 120;
+      c.alpha = 0;
+
+      gsap.to(c, {
+        y: targetY,
+        alpha: 1,
+        duration: entryDur,
+        ease: 'power2.out',
+        delay,
+      });
+    }
+
+    const totalMs = ANTICIPATION_MS + maxDelay * 1000 + 100;
+    setTimeout(() => {
+      entranceCompleteRef.current = true;
+    }, totalMs);
+  };
 
   const applyTheme = async (app: PIXI.Application, cfg: GameConfig) => {
     if (!sessionContainerRef.current) return;
+    const currentCount = ++applyThemeCountRef.current;
 
     try {
-      // 背景設置
-      app.renderer.background.color = parseColor(cfg.theme.bg_color) || 0x111111;
-      if (cfg.bg_image_url) {
-        try {
-          const bgTexture = await PIXI.Assets.load(cfg.bg_image_url);
+      // Render mode: geometric (default, zero-latency) vs themed (load AI images)
+      const renderMode = cfg.metadata.render_mode ?? 'geometric';
+      const isThemed = renderMode === 'themed';
+
+      // Background Image setup based on the first visually defined entity or config.bg_image_url
+      const bgUrl = cfg.bg_image_url;
+      let targetBgAlpha = 0.5;
+
+      const bgEntity = cfg.entities.find(e => e.visual?.bg_alpha !== undefined);
+      if (bgEntity && bgEntity.visual?.bg_alpha !== undefined) {
+          targetBgAlpha = bgEntity.visual.bg_alpha;
+      }
+
+      if (isThemed && bgUrl) {
+        // Themed mode：非同步載入背景，失敗自動 fallback 到深色底
+        PIXI.Assets.load(bgUrl).then((bgTexture) => {
+          if (currentCount !== applyThemeCountRef.current) return;
+          if (!sessionContainerRef.current) return;
+
           if (!backgroundSpriteRef.current) {
             backgroundSpriteRef.current = new PIXI.Sprite(bgTexture);
             sessionContainerRef.current.addChildAt(backgroundSpriteRef.current, 0);
@@ -104,820 +331,1135 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, isActive, onSessi
           bg.y = app.screen.height / 2;
           const scale = Math.max(app.screen.width / bg.texture.width, app.screen.height / bg.texture.height);
           bg.scale.set(scale);
-          bg.alpha = 0.5; // Adjusted to user preference
-          bg.tint = 0xFFFFFF;
-        } catch (e) {
-          console.error("BG load error:", e);
+          bg.alpha = targetBgAlpha;
+        }).catch((e) => {
+          console.warn('[Theme] BG load failed, keeping dark background:', e);
+          app.renderer.background.color = 0x111111;
+        });
+      } else {
+        // Geometric mode 或無 bgUrl：使用深色背景，移除既有 BG sprite
+        if (bgEntity && bgEntity.visual?.bg_alpha) {
+          app.renderer.background.color = 0x111111;
         }
-      } else if (backgroundSpriteRef.current) {
-        sessionContainerRef.current.removeChild(backgroundSpriteRef.current);
-        backgroundSpriteRef.current.destroy();
-        backgroundSpriteRef.current = null;
+        if (backgroundSpriteRef.current) {
+          sessionContainerRef.current.removeChild(backgroundSpriteRef.current);
+          backgroundSpriteRef.current.destroy();
+          backgroundSpriteRef.current = null;
+        }
       }
 
-      // 清除舊的內容
-      if (leftTargetRef.current) {
-        sessionContainerRef.current.removeChild(leftTargetRef.current);
-        leftTargetRef.current.destroy({ children: true });
-        leftTargetRef.current = null;
+      // Clear existing entities
+      Object.keys(entitiesRef.current).forEach(id => {
+        const c = entitiesRef.current[id];
+        sessionContainerRef.current?.removeChild(c);
+        c.destroy({ children: true });
+      });
+      entitiesRef.current = {};
+      entityPhysicsRef.current = {};
+      collisionCooldownRef.current = {};
+
+      // Initialize Entities UI
+      for (const ent of cfg.entities) {
+        const container = new PIXI.Container() as any;
+        container.id = ent.id;
+        container.type = ent.type;
+        container.role = ent.role;
+        container.layout = ent.layout;
+        container.sector = ent.sector;
+        container.ball_binding = ent.ball_binding;
+        
+        const isMixedMode = cfg.metadata.interaction_type === 'MIXED';
+        const isPawnEnt = ent.type === 'controllable_pawn';
+
+        if (isMixedMode && isPawnEnt) {
+          // MIXED: stack paddles vertically, P1 top / P2 bottom
+          container.x = app.screen.width / 2;
+          container.y = getMixedPawnY(getPawnPlayerSlot(ent), app.screen.height);
+        } else if (cfg.metadata.interaction_type === 'SEQUENCE' && isPawnEnt && getEntityRole(ent) === 'basket') {
+          // SEQUENCE: basket 放在螢幕下方 75%，方便接從上方落下的 target
+          container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+          container.y = app.screen.height * 0.75;
+        } else {
+          container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+          // 划龍舟船(team_*_all 綁定)從畫面最底端起步,入場動畫的 targetY 也跟著用 0.92
+          // PULSE/NAVIGATE 等 pawn(打太鼓槌子、套圈圈球板) 放在 0.82 等鼓/物件落下;DRIVE 走自己的物理 init
+          const isTeamBoatInit = isPawnEnt && (ent.ball_binding || '').startsWith('team_');
+          const isCatcherPawn = isPawnEnt && !isTeamBoatInit &&
+            (ent.movement_logic?.atomic_action === 'PULSE' || ent.movement_logic?.atomic_action === 'NAVIGATE');
+          container.y = isTeamBoatInit
+            ? app.screen.height * 0.92
+            : (isCatcherPawn ? app.screen.height * 0.82 : app.screen.height / 2);
+        }
+        container.visible = true;
+
+        const shape = new PIXI.Graphics();
+        const alpha = ent.visual?.alpha ?? 1.0;
+        const role = getEntityRole(ent);
+
+        if (role === 'mushroom') {
+           // 紅色圓形 (蘑菇)
+           shape.circle(0, 0, 45);
+           shape.fill({ color: 0xFF0000, alpha });
+           shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
+        } else if (role === 'basket') {
+           // 藍色中空矩形 (籃子)
+           shape.rect(-60, -30, 120, 60);
+           shape.fill({ color: 0x0000FF, alpha: 0.2 });
+           shape.stroke({ width: 6, color: 0x0000FF, alpha: 1.0 });
+        } else if (ent.type === 'controllable_pawn') {
+           // 圓角矩形球板：MIXED 模式下兩位玩家用不同顏色
+           const pawnColor = isMixedMode
+             ? MIXED_PAWN_COLORS[getPawnPlayerSlot(ent)]
+             : 0x00BFFF;
+           shape.roundRect(-75, -20, 150, 40, 20);
+           shape.fill({ color: pawnColor, alpha });
+           shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
+        } else if (ent.type === 'obstacle' || role === 'obstacle') {
+           // 障礙物:深灰色圓 + 白色 X 標記,與紅色 mushroom / 黃色 target 都明顯區別
+           shape.circle(0, 0, 50);
+           shape.fill({ color: 0x333333, alpha });
+           shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
+           shape.moveTo(-22, -22);
+           shape.lineTo(22, 22);
+           shape.moveTo(22, -22);
+           shape.lineTo(-22, 22);
+           shape.stroke({ width: 5, color: 0xFFFFFF, alpha: 1.0 });
+        } else if (ent.type === 'target') {
+           // MIXED 模式下用白底,於 ticker 中以 tint 動態切換藍/橘;其他模式維持黃色
+           shape.circle(0, 0, 50);
+           shape.fill({ color: isMixedMode ? 0xFFFFFF : 0xFFFF00, alpha });
+           shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
+        } else if (ent.type === 'static') {
+           // role: decoration 視為背景占位,不產生幾何形狀(背景請走 metadata.bg_image_url)
+           if (role !== 'decoration') {
+              shape.rect(-200, -20, 400, 40);
+              shape.fill({ color: 0x333333, alpha });
+              shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
+           }
+        } else {
+           shape.roundRect(-60, -60, 120, 120, 20);
+           shape.fill({ color: 0xFF33CC, alpha });
+           shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
+        }
+
+        container.addChild(shape);
+
+        // Themed mode：幾何打底已就位，async 換成 AI 主題圖片（含厚黑邊框 OutlineFilter）
+        if (isThemed && ent.visual?.image_url) {
+          const imageUrl = ent.visual.image_url;
+          const themeAtAttempt = currentCount;
+          PIXI.Assets.load(imageUrl).then((tex) => {
+            if (themeAtAttempt !== applyThemeCountRef.current) return; // theme 已重置
+            if (!entitiesRef.current[ent.id]) return; // entity 已被清除
+            const sprite = new PIXI.Sprite(tex);
+            sprite.anchor.set(0.5);
+            // 配合幾何 placeholder 尺寸
+            const role2 = getEntityRole(ent);
+            if (role2 === 'paddle') { sprite.width = 150; sprite.height = 50; }
+            else if (role2 === 'basket') { sprite.width = 140; sprite.height = 80; }
+            else if (role2 === 'mushroom' || role2 === 'obstacle') { sprite.width = 100; sprite.height = 100; }
+            else { sprite.width = 120; sprite.height = 120; }
+            sprite.alpha = ent.visual?.alpha ?? 1.0;
+            sprite.filters = [new OutlineFilter({ thickness: 4, color: 0x000000 })];
+            container.removeChildren();
+            container.addChild(sprite);
+          }).catch((e) => {
+            console.warn(`[Theme] image load failed for ${ent.id}, keeping geometric:`, e);
+          });
+        }
+
+        // MIXED 模式：球初始為藍色、半徑縮一半，由 ticker 同步 tint/scale
+        if (isMixedMode && (ent.type === 'target' || ent.type === 'obstacle')) {
+          ballColorRef.current[ent.id] = 'blue';
+          ballScaleRef.current[ent.id] = 0.5;
+        }
+
+        entitiesRef.current[ent.id] = container;
+        sessionContainerRef.current.addChild(container);
       }
-      if (rightTargetRef.current) {
-        sessionContainerRef.current.removeChild(rightTargetRef.current);
-        rightTargetRef.current.destroy({ children: true });
-        rightTargetRef.current = null;
+
+      // MIXED 模式：一次只出現 1 顆球，其餘隱藏
+      if (cfg.metadata.interaction_type === 'MIXED') {
+        let firstSeen = false;
+        for (const ent of cfg.entities) {
+          if (ent.type !== 'target' && ent.type !== 'obstacle') continue;
+          const c = entitiesRef.current[ent.id];
+          if (!c) continue;
+          if (!firstSeen) { c.visible = true; firstSeen = true; }
+          else c.visible = false;
+        }
       }
 
-      leftScoreRef.current = 0;
-      rightScoreRef.current = 0;
-      maintenanceTimerRef.current = 0;
-      leftMaintenanceTimerRef.current = 0;
-      rightMaintenanceTimerRef.current = 0;
-      hasScoredRef.current = false;
-      completedCountsRef.current = 0;
+      if (cfg.metadata.interaction_type === 'SEQUENCE') {
+        for (const ent of cfg.entities) {
+          const container = entitiesRef.current[ent.id];
+          if (!container) continue;
+          const layout = getEntityLayout(ent);
+          if (layout === 'left' || layout === 'right') {
+            container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+          }
+        }
+      }
 
-      // Initialize or Update Instruction Text
-      const min = cfg.logic.target_range?.[0] ?? 0.7;
-      const max = cfg.logic.target_range?.[1] ?? 0.8;
-      const holdTimeSec = cfg.logic.hold_time ?? 1.0;
-      const minEngagement = cfg.logic.min_engagement ?? 0.05;
-      const mode = cfg.logic.mode || (cfg.logic.is_independent ? GameMode.INDEPENDENT : GameMode.DUAL);
-
-      let modeStr = '';
-      if (mode === GameMode.AVERAGE) modeStr = '合力模式';
-      else if (mode === GameMode.DUAL) modeStr = '獨立模式';
-      else if (mode === GameMode.INDEPENDENT) modeStr = '節奏模式';
-      else if (mode === GameMode.DIFF) modeStr = '平衡模式';
-      else modeStr = mode;
-
-      let targetLabel = '目標力道';
-      if (mode === GameMode.DIFF) targetLabel = '平衡誤差';
-      const instructionStr = `${targetLabel}：${min.toFixed(2)}-${max.toFixed(2)}，維持：${holdTimeSec.toFixed(1)}s\n[模式：${modeStr} | 代償：${minEngagement}]`;
-
+      // Setup UI Text
+      const instructionStr = `[${cfg.metadata.game_name}] 模式: ${cfg.metadata.interaction_type}`;
       if (!instructionTextRef.current) {
         instructionTextRef.current = new PIXI.Text({
           text: instructionStr,
-          style: {
-            fill: 0xffffff,
-            fontSize: 20,
-            fontWeight: 'bold',
-            stroke: { color: 0x000000, width: 4 },
-            dropShadow: { color: 0x000000, alpha: 0.8, blur: 4, distance: 2 }
-          }
+          style: { fill: 0xffffff, fontSize: 20, fontWeight: 'bold' }
         });
         instructionTextRef.current.anchor.set(0.5, 0);
         sessionContainerRef.current.addChild(instructionTextRef.current);
-      } else {
-        instructionTextRef.current.text = instructionStr;
       }
+      instructionTextRef.current.text = instructionStr;
       instructionTextRef.current.x = app.screen.width / 2;
       instructionTextRef.current.y = 10;
+      
+      // Sequence Bulbs UI — 先清除上一次的 bulb container 避免疊加
+      if (sequenceBulbContainerRef.current) {
+        sessionContainerRef.current.removeChild(sequenceBulbContainerRef.current);
+        sequenceBulbContainerRef.current.destroy({ children: true });
+        sequenceBulbContainerRef.current = null;
+        sequenceBulbsRef.current = [];
+      }
 
-      // Initialize Compensation Warning
-      if (!compensationWarningRef.current) {
-        compensationWarningRef.current = new PIXI.Text({
-          text: '請雙手同時參與，避免代償！',
-          style: {
-            fill: 0xFF0000,
-            fontSize: 28,
-            fontWeight: 'bold',
-            stroke: { color: 0x000000, width: 4 }
-          }
+      if (playerZonesRef.current) {
+        sessionContainerRef.current.removeChild(playerZonesRef.current);
+        playerZonesRef.current.destroy({ children: true });
+        playerZonesRef.current = null;
+      }
+
+      if (cfg.metadata.interaction_type === 'SEQUENCE') {
+        const zones = new PIXI.Container();
+        const halfW = app.screen.width / 2;
+        const fullH = app.screen.height;
+
+        const leftZone = new PIXI.Graphics()
+          .rect(0, 0, halfW, fullH)
+          .fill({ color: 0x0066FF, alpha: 0.08 });
+        const rightZone = new PIXI.Graphics()
+          .rect(halfW, 0, halfW, fullH)
+          .fill({ color: 0x00CC66, alpha: 0.08 });
+
+        const leftLabel = new PIXI.Text({
+          text: '玩家 1',
+          style: { fill: 0x66B3FF, fontSize: 16, fontWeight: 'bold' }
         });
-        compensationWarningRef.current.anchor.set(0.5);
-        sessionContainerRef.current.addChild(compensationWarningRef.current);
-      }
-      compensationWarningRef.current.x = app.screen.width / 2;
-      compensationWarningRef.current.y = app.screen.height / 2 + 150;
-      compensationWarningRef.current.visible = false;
+        leftLabel.anchor.set(0.5, 0);
+        leftLabel.x = app.screen.width * 0.25;
+        leftLabel.y = 90;
 
-      // Score Text (Left - Green)
-      // Score Text (Left)
-      const themeColor = parseColor(cfg.theme.color);
-      if (!leftScoreTextRef.current) {
-        leftScoreTextRef.current = new PIXI.Text({
-          text: `左側達成次數: 0`,
-          style: {
-            fill: themeColor,
-            fontSize: 28,
-            fontWeight: 'bold',
-            stroke: { color: 0x000000, width: 4 },
-            dropShadow: { color: 0x000000, alpha: 0.8, blur: 4, distance: 2 }
-          }
+        const rightLabel = new PIXI.Text({
+          text: '玩家 2',
+          style: { fill: 0x66E699, fontSize: 16, fontWeight: 'bold' }
         });
-        leftScoreTextRef.current.anchor.set(0, 1);
-        sessionContainerRef.current.addChild(leftScoreTextRef.current);
-      } else {
-        leftScoreTextRef.current.style.fill = themeColor;
+        rightLabel.anchor.set(0.5, 0);
+        rightLabel.x = app.screen.width * 0.75;
+        rightLabel.y = 90;
+
+        zones.addChild(leftZone, rightZone, leftLabel, rightLabel);
+        sessionContainerRef.current.addChildAt(zones, 0);
+        playerZonesRef.current = zones;
+
+        const bulbLeft = new PIXI.Graphics().circle(-40, 0, 15).fill(0xFFFF00).stroke({width: 4, color: 0x000000});
+        const bulbRight = new PIXI.Graphics().circle(40, 0, 15).fill(0xFFFF00).stroke({width: 4, color: 0x000000});
+
+        const bulbContainer = new PIXI.Container();
+        bulbContainer.addChild(bulbLeft, bulbRight);
+        bulbContainer.x = app.screen.width / 2;
+        bulbContainer.y = 50;
+        sessionContainerRef.current.addChild(bulbContainer);
+
+        sequenceBulbContainerRef.current = bulbContainer;
+        sequenceBulbsRef.current = [bulbLeft, bulbRight];
+
+        // 初始化記憶 pattern：AI 未提供時 fallback 到 1↔2 交替
+        const pattern = cfg.metadata.sequence_pattern;
+        sequencePatternRef.current = (pattern && pattern.length > 0)
+          ? pattern.map(n => (n === 2 ? 2 : 1))
+          : [1, 2];
+        sequenceIndexRef.current = 0;
+        sequenceStepRef.current = sequencePatternRef.current[0];
+        bulbLeft.alpha = sequenceStepRef.current === 1 ? 1.0 : 0.2;
+        bulbRight.alpha = sequenceStepRef.current === 2 ? 1.0 : 0.2;
       }
-      leftScoreTextRef.current.x = 40;
-      leftScoreTextRef.current.y = app.screen.height - 40;
 
-      const isDual = (mode === GameMode.DUAL || mode === GameMode.INDEPENDENT);
-      // 修正：SUM, AVERAGE, DIFF 模式強制顯示左側計分文字做為「總計」
-      const isSingleContainer = (mode === GameMode.SUM || mode === GameMode.AVERAGE || mode === GameMode.DIFF);
-      const isLeftSide = (cfg.logic.side === 'left' || cfg.logic.side === 'both' || isSingleContainer);
-
-      if (isSingleContainer) {
-        leftScoreTextRef.current.anchor.set(0.5, 1);
-        leftScoreTextRef.current.x = app.screen.width / 2;
-        leftScoreTextRef.current.text = `總達成次數: 0`;
-      } else {
-        leftScoreTextRef.current.anchor.set(0, 1);
-        leftScoreTextRef.current.x = 40;
-        leftScoreTextRef.current.text = `左側達成次數: 0`;
-      }
-      leftScoreTextRef.current.visible = isLeftSide;
-
-      // Score Text (Right)
-      if (!rightScoreTextRef.current) {
-        rightScoreTextRef.current = new PIXI.Text({
-          text: `右側達成次數: 0`,
-          style: {
-            fill: themeColor,
-            fontSize: 28,
-            fontWeight: 'bold',
-            stroke: { color: 0x000000, width: 4 },
-            dropShadow: { color: 0x000000, alpha: 0.8, blur: 4, distance: 2 }
-          }
-        });
-        rightScoreTextRef.current.anchor.set(1, 1);
-        sessionContainerRef.current.addChild(rightScoreTextRef.current);
-      } else {
-        rightScoreTextRef.current.style.fill = themeColor;
-      }
-      rightScoreTextRef.current.x = app.screen.width - 40;
-      rightScoreTextRef.current.y = app.screen.height - 40;
-      const isRightSide = (cfg.logic.side === 'right' || cfg.logic.side === 'both');
-      rightScoreTextRef.current.visible = isDual && isRightSide;
-      rightScoreTextRef.current.text = `右側達成次數: ${rightScoreRef.current}`;
-
-      // Rhythm Error Text
-      if (!rhythmErrorTextRef.current) {
-        rhythmErrorTextRef.current = new PIXI.Text({
-          text: '請放鬆另一隻手，避免聯帶運動！',
-          style: { fill: 0xFF0000, fontSize: 28, fontWeight: 'bold', stroke: { color: 0x000000, width: 4 } }
-        });
-        rhythmErrorTextRef.current.anchor.set(0.5);
-        sessionContainerRef.current.addChild(rhythmErrorTextRef.current);
-      }
-      rhythmErrorTextRef.current.x = app.screen.width / 2;
-      rhythmErrorTextRef.current.y = app.screen.height / 2 + 200;
-      rhythmErrorTextRef.current.visible = false;
-
-      // Rhythm Target Marker
-      if (!rhythmTargetMarkerRef.current) {
-        rhythmTargetMarkerRef.current = new PIXI.Graphics();
-        sessionContainerRef.current.addChild(rhythmTargetMarkerRef.current);
-      }
-      rhythmTargetMarkerRef.current.clear();
-
-      // Difficulty Score Text
-      if (!difficultyTextRef.current) {
-        difficultyTextRef.current = new PIXI.Text({
-          text: `模式：${modeStr} | 難度等級: ${cfg.logic.difficulty_score || 1}`,
-          style: {
-            fill: 0xFFAA00,
-            fontSize: 24,
-            fontWeight: 'bold',
-            stroke: { color: 0x000000, width: 4 },
-            dropShadow: { color: 0x000000, alpha: 0.8, blur: 4, distance: 2 }
-          }
-        });
-        difficultyTextRef.current.anchor.set(1, 0);
-        sessionContainerRef.current.addChild(difficultyTextRef.current);
-      } else {
-        difficultyTextRef.current.text = `模式：${modeStr} | 難度等級: ${cfg.logic.difficulty_score || 1}`;
-      }
-      difficultyTextRef.current.x = app.screen.width - 20;
-      difficultyTextRef.current.y = 10;
-      difficultyTextRef.current.visible = true;
-
-      // Diff Warning Text
-      if (!diffWarningTextRef.current) {
-        diffWarningTextRef.current = new PIXI.Text({
-          text: '',
-          style: { fill: 0xFF0000, fontSize: 28, fontWeight: 'bold', stroke: { color: 0x000000, width: 4 } }
-        });
-        diffWarningTextRef.current.anchor.set(0.5);
-        sessionContainerRef.current.addChild(diffWarningTextRef.current);
-      }
-      diffWarningTextRef.current.x = app.screen.width / 2;
-      diffWarningTextRef.current.y = app.screen.height / 2 + 100;
-      diffWarningTextRef.current.visible = false;
-
-      const createTarget = async (side: 'left' | 'right') => {
-        const target = new PIXI.Container();
-        const themeColor = parseColor(cfg.theme.color);
-
-        // Always add a base shape for fallback visibility
-        const fallback = new PIXI.Graphics();
-        fallback.roundRect(-60, -60, 120, 120, 20);
-        fallback.fill({ color: themeColor, alpha: 0.2 });
-        fallback.setStrokeStyle({ width: 4, color: themeColor, alpha: 0.8 });
-        fallback.stroke();
-        target.addChild(fallback);
-
-        if (cfg.image_url) {
-          try {
-            console.log(`Loading image for ${side} target:`, cfg.image_url.substring(0, 50) + "...");
-            const texture = await PIXI.Assets.load(cfg.image_url);
-            const sprite = new PIXI.Sprite(texture);
-            sprite.anchor.set(0.5);
-            const maxDim = 150;
-            const scale = maxDim / Math.max(sprite.width, sprite.height);
-            sprite.scale.set(scale);
-            sprite.alpha = 1.0; // Forced HolidayBall Standard
-            target.addChild(sprite);
-            // If image loaded, we still keep the fallback but make it very subtle
-            fallback.alpha = 0.05;
-          } catch (e) {
-            console.error(`Asset load error for ${side}:`, e);
-            // Keep fallback clearly visible if image fails
-            fallback.alpha = 0.5;
-          }
+      // Ensure background is always at index 0
+      if (backgroundSpriteRef.current && sessionContainerRef.current) {
+        if (sessionContainerRef.current.children.includes(backgroundSpriteRef.current)) {
+          sessionContainerRef.current.setChildIndex(backgroundSpriteRef.current, 0);
         }
-
-        sessionContainerRef.current?.addChild(target);
-        return target;
-      };
-
-      leftTargetRef.current = await createTarget('left');
-      if (mode === GameMode.DUAL || mode === GameMode.INDEPENDENT) {
-        rightTargetRef.current = await createTarget('right');
       }
-
-      // Initialize visual feedback elements
-      if (!feedbackContainerRef.current) {
-        feedbackContainerRef.current = new PIXI.Container();
-        sessionContainerRef.current.addChild(feedbackContainerRef.current);
-      }
-
-      // Balance Line (Horizontal Line at Center)
-      if (!balanceLineRef.current) {
-        const line = new PIXI.Graphics();
-        feedbackContainerRef.current.addChild(line);
-        balanceLineRef.current = line;
-      }
-      balanceLineRef.current.clear();
-      if (cfg.logic.mode === GameMode.DIFF) {
-        balanceLineRef.current.setStrokeStyle({ width: 2, color: 0x555555, alpha: 0.5 });
-        balanceLineRef.current.moveTo(app.screen.width * 0.1, app.screen.height / 2);
-        balanceLineRef.current.lineTo(app.screen.width * 0.9, app.screen.height / 2);
-        balanceLineRef.current.stroke();
-      }
-
-      // Target Zone for Navigator Mode
-      if (!targetZoneRef.current) {
-        const zone = new PIXI.Graphics();
-        feedbackContainerRef.current.addChild(zone);
-        targetZoneRef.current = zone;
-      }
-      targetZoneRef.current.clear();
-
-      // Initialize Progress Rings as children of targets
-      if (!leftProgressRingRef.current && leftTargetRef.current) {
-        leftProgressRingRef.current = new PIXI.Graphics();
-        leftTargetRef.current.addChild(leftProgressRingRef.current);
-      }
-      if (leftProgressRingRef.current) {
-        leftProgressRingRef.current.clear();
-        leftProgressRingRef.current.visible = isLeftSide;
-      }
-
-      if (!rightProgressRingRef.current && rightTargetRef.current) {
-        rightProgressRingRef.current = new PIXI.Graphics();
-        rightTargetRef.current.addChild(rightProgressRingRef.current);
-      }
-      if (rightProgressRingRef.current) {
-        rightProgressRingRef.current.clear();
-        rightProgressRingRef.current.visible = isDual && isRightSide;
-      }
-
-      // --- STABLE_HOLD Visuals ---
-      if (!breathingBallRef.current) {
-        breathingBallRef.current = new PIXI.Graphics();
-        sessionContainerRef.current.addChild(breathingBallRef.current);
-      }
-      if (!breathingBallOuterRef.current) {
-        breathingBallOuterRef.current = new PIXI.Graphics();
-        sessionContainerRef.current.addChildAt(breathingBallOuterRef.current, 1); // Behind inner ball
-      }
-
-      const isStableHold = mode === GameMode.STABLE_HOLD;
-      breathingBallRef.current.clear();
-      breathingBallOuterRef.current.clear();
-      breathingBallRef.current.visible = isStableHold;
-      breathingBallOuterRef.current.visible = isStableHold;
-
-      if (isStableHold) {
-        // Hide targets and other rings if in blood pressure mode
-        if (leftTargetRef.current) leftTargetRef.current.visible = false;
-        if (rightTargetRef.current) rightTargetRef.current.visible = false;
-        if (leftProgressRingRef.current) leftProgressRingRef.current.visible = false;
-        if (rightProgressRingRef.current) rightProgressRingRef.current.visible = false;
-
-        // Initial Draw
-        const ballColor = 0x22d3ee; // Cyan
-        breathingBallOuterRef.current.circle(0, 0, 150);
-        breathingBallOuterRef.current.fill({ color: ballColor, alpha: 0.1 });
-        breathingBallOuterRef.current.setStrokeStyle({ width: 2, color: ballColor, alpha: 0.3 });
-        breathingBallOuterRef.current.stroke();
-
-        breathingBallRef.current.circle(0, 0, 100);
-        breathingBallRef.current.fill({ color: ballColor, alpha: 0.6 });
-
-        breathingBallRef.current.x = app.screen.width / 2;
-        breathingBallRef.current.y = app.screen.height / 2;
-        breathingBallOuterRef.current.x = app.screen.width / 2;
-        breathingBallOuterRef.current.y = app.screen.height / 2;
-      }
-
-      // --- Session Timer UI ---
-      if (!progressBarRef.current) {
-        progressBarRef.current = new PIXI.Graphics();
-        sessionContainerRef.current.addChild(progressBarRef.current);
-      }
-      if (!timerTextRef.current) {
-        timerTextRef.current = new PIXI.Text({
-          text: '',
-          style: {
-            fill: 0xffffff,
-            fontSize: 18,
-            fontWeight: 'bold',
-            stroke: { color: 0x000000, width: 3 }
-          }
-        });
-        timerTextRef.current.anchor.set(0, 0);
-        sessionContainerRef.current.addChild(timerTextRef.current);
-      }
-      timerTextRef.current.x = 20;
-      timerTextRef.current.y = 10;
-      progressBarRef.current.clear();
-
-    } catch (err) {
-      console.error("Error applying theme:", err);
+      
+    } catch (e) {
+      console.error(e);
     }
   };
 
   useEffect(() => {
-    let tickerCb: () => void;
     let isMounted = true;
-
     const setup = async () => {
-      try {
-        const app = await getOrInitApp();
-        if (!isMounted || !containerRef.current) return;
+      const app = await getOrInitApp();
+      if (!isMounted || !containerRef.current) return;
 
-        if (app.canvas.parentNode !== containerRef.current) {
-          containerRef.current.appendChild(app.canvas);
-          app.resizeTo = containerRef.current;
-          app.resize();
-        }
+      if (app.canvas.parentNode !== containerRef.current) {
+        containerRef.current.appendChild(app.canvas);
+        app.resizeTo = containerRef.current;
+        app.resize();
+      }
+      appRef.current = app;
 
+      if (!sessionContainerRef.current) {
         const sessionContainer = new PIXI.Container();
         app.stage.addChild(sessionContainer);
         sessionContainerRef.current = sessionContainer;
+      }
 
-        // Helper functions for ticker logic - defined inside setup to access refs/app
-        const updateTargetAction = (target: PIXI.Container, targetVal: number, cfg: any, app: any) => {
-          if (cfg.logic.mode === GameMode.DIFF) {
-            // DIFF mode mapping: rotation綁定(right-left) 讓右邊出力時向右(順時針)傾斜
-            const diffActual = (stateRef.current.pressure.right - stateRef.current.pressure.left);
-            target.rotation = diffActual * 1.2; // 調整旋轉靈敏度
-            target.scale.set(1.5);
+      const tickerCb = () => {
+        const { config: cfg, pressure: prs, pressures: allPrs, isActive: active } = stateRef.current;
+        if (!sessionContainerRef.current || !app) return;
+
+        const isCalibration = cfg.metadata.game_id === 'calibration';
+        const normalizedPrs = isCalibration ? prs : {
+          left: prs.left / (mvcL || 1.0),
+          right: prs.right / (mvcR || 1.0)
+        };
+
+        if (!active) {
             return;
-          }
-          switch (cfg.logic.action) {
-            case GameAction.SCALE: target.scale.set(1 + targetVal * 2.5); break;
-            case GameAction.MOVE_Y: target.y = (app.screen.height / 2) - (targetVal * (app.screen.height * 0.4)); target.scale.set(1.5); break;
-            case GameAction.MOVE_X:
-              const centerX = target.x; // Stay in its column
-              target.x = centerX + (targetVal * (app.screen.width * 0.1) - (app.screen.width * 0.05));
-              target.scale.set(1.5);
-              break;
-            case GameAction.OPACITY: target.alpha = 0.05 + targetVal * 0.95; target.scale.set(1 + targetVal * 2); break;
-            case GameAction.COLOR_SHIFT: target.alpha = 0.6 + targetVal * 0.4; target.scale.set(1.2 + targetVal * 0.8); break;
-            case GameAction.ROTATE: target.rotation = targetVal * Math.PI; target.scale.set(2); break;
-            case GameAction.PULSE: target.scale.set(1 + targetVal * 0.5); break;
-          }
-        };
-
-        const updateProgressUI = (target: PIXI.Container, ring: PIXI.Graphics | null, timer: number, required: number, min: number, max: number) => {
-          const { config: cfg } = stateRef.current;
-          const themeColor = parseColor(cfg.theme.color);
-          if (target instanceof PIXI.Container) {
-            target.children.forEach(child => { if ('tint' in child) (child as any).tint = themeColor; });
-          }
-          if (ring) {
-            const progress = Math.min(1, timer / required);
-            ring.setStrokeStyle({ width: 8, color: themeColor, alpha: 0.8 });
-            // Use local (0, 0) coordinates since ring is now a child of the target container
-            ring.arc(0, 0, 80, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * progress));
-            ring.stroke();
-          }
-          if (instructionTextRef.current) {
-            const progSec = (timer / 1000).toFixed(1);
-            const { config: cfg } = stateRef.current;
-            const mode = cfg.logic.mode || (cfg.logic.is_independent ? GameMode.INDEPENDENT : GameMode.DUAL);
-            let modeStr = '';
-            if (mode === GameMode.SUM) modeStr = '合力模式';
-            else if (mode === GameMode.AVERAGE) modeStr = '平均模式';
-            else if (mode === GameMode.DUAL) modeStr = '雙手獨立';
-            else if (mode === GameMode.INDEPENDENT) modeStr = '節奏重置';
-            else if (mode === GameMode.DIFF) modeStr = '平衡大師';
-            else modeStr = mode;
-
-            let targetLabel = '目標力道';
-            if (mode === GameMode.DIFF) targetLabel = '平衡誤差';
-
-            instructionTextRef.current.text = `${targetLabel}：${min.toFixed(2)}-${max.toFixed(2)}，進度：${progSec}s / ${(required / 1000).toFixed(1)}s`;
-          }
-        };
-
-        const resetTargetTint = (target: PIXI.Container, compensationDetected: boolean) => {
-          if (target instanceof PIXI.Container) {
-            target.children.forEach(child => { if ('tint' in child) (child as any).tint = (compensationDetected ? 0xFF0000 : 0xFFFFFF); });
-          }
-        };
-
-        const showSuccessFeedback = (target: PIXI.Container) => {
-          const { config: cfg } = stateRef.current;
-          const themeColor = parseColor(cfg.theme.color);
-          gsap.to(target.scale, { x: target.scale.x * 1.5, y: target.scale.y * 1.5, duration: 0.2, yoyo: true, repeat: 1 });
-          const txt = new PIXI.Text({ text: "讚！", style: { fill: themeColor, fontSize: 40, fontWeight: 'bold' } });
-          txt.anchor.set(0.5);
-          txt.x = target.x; txt.y = target.y - 120;
-          feedbackContainerRef.current?.addChild(txt);
-          gsap.to(txt, { y: txt.y - 100, alpha: 0, duration: 1, onComplete: () => txt.destroy() });
-        };
-
-        tickerCb = () => {
-          const { config: cfg, pressure: prs, isActive: active } = stateRef.current;
-          if (!sessionContainerRef.current || !app) return;
-
-          if (!active) {
-            // Reset visibility and reset UI when not active
-            if (progressBarRef.current) progressBarRef.current.visible = false;
-            if (timerTextRef.current) timerTextRef.current.visible = false;
-
-            const mode = cfg.logic.mode || (cfg.logic.is_independent ? GameMode.INDEPENDENT : GameMode.DUAL);
-            [leftTargetRef, rightTargetRef].forEach((ref, i) => {
-              if (ref.current) {
-                const isSingleContainer = (mode === GameMode.SUM || mode === GameMode.AVERAGE || mode === GameMode.DIFF);
-                const isRightSide = (cfg.logic.side === 'right' || isSingleContainer);
-                const isLeftSide = (cfg.logic.side === 'left' || cfg.logic.side === 'both' || isSingleContainer);
-
-                const visible = (i === 0 && isLeftSide) || (i === 1 && isRightSide && (mode === GameMode.DUAL || mode === GameMode.INDEPENDENT));
-
-                ref.current.alpha = 0.5;
-                ref.current.rotation = 0;
-                ref.current.visible = visible;
-
-                if (isSingleContainer) {
-                  ref.current.x = app.screen.width / 2;
-                } else {
-                  ref.current.x = i === 0 ? app.screen.width * 0.25 : app.screen.width * 0.75;
-                }
-                ref.current.y = app.screen.height / 2;
-              }
-            });
-            return;
-          }
-
-          // --- Data Collection ---
-          totalPressureLRef.current += prs.left;
-          totalPressureRRef.current += prs.right;
-          totalSamplesRef.current += 1;
-
-          const mode = cfg.logic.mode || (cfg.logic.is_independent ? GameMode.INDEPENDENT : GameMode.DUAL);
-          const minEngagement = cfg.logic.min_engagement ?? 0.05;
-          const [min, max] = cfg.logic.target_range ?? [0.7, 0.8];
-          const requiredHoldTime = (cfg.logic.hold_time ?? 1.0) * 1000;
-
-          // Global UI resets
-          if (rhythmTargetMarkerRef.current) rhythmTargetMarkerRef.current.clear();
-          if (rhythmErrorTextRef.current) rhythmErrorTextRef.current.visible = false;
-          if (compensationWarningRef.current) compensationWarningRef.current.visible = false;
-          if (diffWarningTextRef.current) diffWarningTextRef.current.visible = false;
-          if (leftProgressRingRef.current) leftProgressRingRef.current.clear();
-          if (rightProgressRingRef.current) rightProgressRingRef.current.clear();
-
-          // --- Session Analytics & Timer ---
-          const totalDuration = cfg.logic.total_duration || 60;
-          const elapsedSec = (performance.now() - sessionStartTimeRef.current) / 1000;
-          const remainingSec = Math.max(0, totalDuration - elapsedSec);
-
-          if (progressBarRef.current && timerTextRef.current) {
-            const progress = remainingSec / totalDuration;
-            const barWidth = app.screen.width * 0.8;
-            const barHeight = 8;
-            const barX = (app.screen.width - barWidth) / 2;
-            const barY = app.screen.height - 20;
-
-            progressBarRef.current.clear();
-            // Background
-            progressBarRef.current.roundRect(barX, barY, barWidth, barHeight, 4);
-            progressBarRef.current.fill({ color: 0x222222, alpha: 0.5 });
-            // Foreground (Vacation Gradient substitute: Cyan to Emerald)
-            const activeWidth = barWidth * progress;
-            progressBarRef.current.roundRect(barX, barY, activeWidth, barHeight, 4);
-            progressBarRef.current.fill({ color: 0x00E5FF, alpha: 0.8 }); // Vacation Cyan
-
-            timerTextRef.current.text = `剩餘假期時間: ${Math.ceil(remainingSec)}s`;
-            timerTextRef.current.visible = true;
-            progressBarRef.current.visible = true;
-          }
-
-          if (remainingSec <= 0 && !sessionEndedRef.current) {
-            // Session Ended
-            sessionEndedRef.current = true;
-            onSessionEnd({
-              effectiveSeconds: totalEffectiveMSRef.current / 1000,
-              totalSeconds: totalDuration,
-              avgPressureL: totalPressureLRef.current / Math.max(1, totalSamplesRef.current),
-              avgPressureR: totalPressureRRef.current / Math.max(1, totalSamplesRef.current),
-              maxPressure: maxPressureRef.current,
-              compensationOccurred: compensationCountRef.current > (totalSamplesRef.current * 0.05)
-            });
-            return;
-          }
-
-          // Track Max Pressure
-          const currentMax = Math.max(prs.left, prs.right);
-          if (currentMax > maxPressureRef.current) {
-            maxPressureRef.current = currentMax;
-          }
-
-          // MODE LOGIC START
-          switch (mode) {
-            case GameMode.INDEPENDENT: {
-              // Unlock Logic: Both hands must relax below minEngagement to allow next target
-              if (hasScoredRef.current) {
-                if (prs.left < minEngagement && prs.right < minEngagement) {
-                  hasScoredRef.current = false;
-                  rhythmTargetSideRef.current = Math.random() > 0.5 ? 'left' : 'right';
-                  rhythmNextTargetTimeRef.current = performance.now() + 5000;
-                }
-              }
-
-              if (rhythmTargetSideRef.current === null) {
-                rhythmTargetSideRef.current = Math.random() > 0.5 ? 'left' : 'right';
-              }
-
-              const isTargetLeft = rhythmTargetSideRef.current === 'left';
-              [leftTargetRef, rightTargetRef].forEach((ref, i) => {
-                const target = ref.current;
-                if (!target) return;
-                const isThisSide = (i === 0 && isTargetLeft) || (i === 1 && isTargetLeft === false);
-
-                // 視覺隱藏：非目標側 visible = false
-                const isRightSide = (cfg.logic.side === 'right' || cfg.logic.side === 'both');
-                const isLeftSide = (cfg.logic.side === 'left' || cfg.logic.side === 'both');
-
-                target.visible = isThisSide && ((i === 0 && isLeftSide) || (i === 1 && isRightSide));
-                if (!target.visible) return;
-
-                // 目標側得分後設為 alpha = 0.2
-                target.alpha = hasScoredRef.current ? 0.2 : 1.0;
-
-                target.x = i === 0 ? app.screen.width * 0.25 : app.screen.width * 0.75;
-                target.y = app.screen.height / 2;
-
-                if (isThisSide && !hasScoredRef.current) {
-                  const val = i === 0 ? prs.left : prs.right;
-                  const oppositeVal = i === 0 ? prs.right : prs.left;
-
-                  if (rhythmTargetMarkerRef.current) {
-                    const themeColor = parseColor(cfg.theme.color);
-                    rhythmTargetMarkerRef.current.setStrokeStyle({ width: 4, color: themeColor, alpha: 0.3 });
-                    rhythmTargetMarkerRef.current.drawCircle(target.x, target.y, 110);
-                    rhythmTargetMarkerRef.current.stroke();
-                  }
-
-                  updateTargetAction(target, Math.max(0, Math.min(1, val)), cfg, app);
-
-                  const success = val >= min && val <= max && oppositeVal < minEngagement;
-                  const compensation = val >= min && val <= max && oppositeVal >= minEngagement;
-
-                  if (compensation && rhythmErrorTextRef.current) {
-                    rhythmErrorTextRef.current.visible = true;
-                    compensationCountRef.current += 1;
-                  }
-
-                  if (success) {
-                    maintenanceTimerRef.current += app.ticker.deltaMS;
-                    totalEffectiveMSRef.current += app.ticker.deltaMS;
-                    const ring = i === 0 ? leftProgressRingRef.current : rightProgressRingRef.current;
-                    updateProgressUI(target, ring, maintenanceTimerRef.current, requiredHoldTime, min, max);
-                    if (maintenanceTimerRef.current >= requiredHoldTime) {
-                      maintenanceTimerRef.current = 0;
-                      if (i === 0) {
-                        leftScoreRef.current++;
-                        if (leftScoreTextRef.current) leftScoreTextRef.current.text = `左側達成次數: ${leftScoreRef.current}`;
-                      } else {
-                        rightScoreRef.current++;
-                        if (rightScoreTextRef.current) rightScoreTextRef.current.text = `右側達成次數: ${rightScoreRef.current}`;
-                      }
-                      hasScoredRef.current = true;
-                      showSuccessFeedback(target);
-                    }
-                  } else {
-                    maintenanceTimerRef.current = 0;
-                    resetTargetTint(target, compensation);
-                  }
-                } else if (isThisSide && hasScoredRef.current) {
-                  // Already scored but still showing dimmed
-                  const val = i === 0 ? prs.left : prs.right;
-                  updateTargetAction(target, Math.max(0, Math.min(1, val)), cfg, app);
-                }
-              });
-              break;
-            }
-
-            case GameMode.SUM:
-            case GameMode.AVERAGE: {
-              const target = leftTargetRef.current;
-              if (rightTargetRef.current) rightTargetRef.current.visible = false;
-              if (target) {
-                target.visible = true;
-                target.x = app.screen.width / 2;
-                target.y = app.screen.height / 2;
-
-                const val = mode === GameMode.SUM ? (prs.left + prs.right) : (prs.left + prs.right) / 2;
-                updateTargetAction(target, Math.max(0, Math.min(1, val)), cfg, app);
-
-                const success = val >= min && val <= max && prs.left > minEngagement && prs.right > minEngagement;
-                const compensation = val >= min && val <= max && (prs.left <= minEngagement || prs.right <= minEngagement);
-
-                if (compensation && compensationWarningRef.current) compensationWarningRef.current.visible = true;
-
-                if (success) {
-                  maintenanceTimerRef.current += app.ticker.deltaMS;
-                  totalEffectiveMSRef.current += app.ticker.deltaMS;
-                  updateProgressUI(target, leftProgressRingRef.current, maintenanceTimerRef.current, requiredHoldTime, min, max);
-                  if (maintenanceTimerRef.current >= requiredHoldTime) {
-                    maintenanceTimerRef.current = 0;
-                    leftScoreRef.current++;
-                    if (leftScoreTextRef.current) leftScoreTextRef.current.text = `總達成次數: ${leftScoreRef.current}`;
-                    showSuccessFeedback(target);
-                  }
-                } else {
-                  maintenanceTimerRef.current = 0;
-                  resetTargetTint(target, compensation);
-                }
-              }
-              break;
-            }
-
-            case GameMode.DIFF: {
-              const target = leftTargetRef.current;
-              if (rightTargetRef.current) rightTargetRef.current.visible = false;
-              if (target) {
-                target.visible = true;
-                if (!target.visible) break;
-
-                target.x = app.screen.width / 2;
-                target.y = app.screen.height / 2;
-                const diffVal = Math.abs(prs.left - prs.right);
-                updateTargetAction(target, diffVal, cfg, app);
-
-                const success = diffVal >= min && diffVal <= max && prs.left > minEngagement && prs.right > minEngagement;
-                const balanceIssue = (diffVal > max) && prs.left > minEngagement && prs.right > minEngagement;
-
-                if (balanceIssue && diffWarningTextRef.current) {
-                  diffWarningTextRef.current.text = prs.left > prs.right ? '左手太用力了！' : '右手太用力了！';
-                  diffWarningTextRef.current.visible = true;
-                }
-
-                if (success) {
-                  maintenanceTimerRef.current += app.ticker.deltaMS;
-                  totalEffectiveMSRef.current += app.ticker.deltaMS;
-                  updateProgressUI(target, leftProgressRingRef.current, maintenanceTimerRef.current, requiredHoldTime, min, max);
-                  if (maintenanceTimerRef.current >= requiredHoldTime) {
-                    maintenanceTimerRef.current = 0;
-                    leftScoreRef.current++; // Unified score stored in leftScore for single-container modes
-                    if (leftScoreTextRef.current) leftScoreTextRef.current.text = `總達成次數: ${leftScoreRef.current}`;
-                    showSuccessFeedback(target);
-                  }
-                } else {
-                  maintenanceTimerRef.current = 0;
-                  resetTargetTint(target, balanceIssue);
-                }
-              }
-              break;
-            }
-
-            case GameMode.STABLE_HOLD: {
-              const ball = breathingBallRef.current;
-              const outer = breathingBallOuterRef.current;
-              if (ball && outer) {
-                const val = (prs.left + prs.right) / 2;
-                const targetVal = 0.3;
-                const tolerance = 0.05; // ±5%
-
-                // Visual Scaling
-                const baseScale = 1.0;
-                const targetScale = baseScale + (val * 1.5);
-                ball.scale.set(targetScale);
-
-                // Breath effect for outer ring
-                const time = performance.now() / 1000;
-                const breathScale = 1.0 + Math.sin(time * 2) * 0.05;
-                outer.scale.set(breathScale);
-
-                const success = val >= (targetVal - tolerance) && val <= (targetVal + tolerance);
-
-                if (success) {
-                  maintenanceTimerRef.current += app.ticker.deltaMS;
-                  totalEffectiveMSRef.current += app.ticker.deltaMS;
-
-                  // Color feedback
-                  (ball as any).tint = 0x34d399; // Emerald
-                  (outer as any).tint = 0x34d399;
-                } else {
-                  maintenanceTimerRef.current = 0;
-                  (ball as any).tint = 0x22d3ee; // Cyan
-                  (outer as any).tint = 0x22d3ee;
-
-                  if (val > (targetVal + tolerance)) {
-                    if (diffWarningTextRef.current) {
-                      diffWarningTextRef.current.text = '放鬆一點...';
-                      diffWarningTextRef.current.visible = true;
-                    }
-                  } else if (val < (targetVal - tolerance) && val > minEngagement) {
-                    if (diffWarningTextRef.current) {
-                      diffWarningTextRef.current.text = '再多出一點力...';
-                      diffWarningTextRef.current.visible = true;
-                    }
-                  }
-                }
-
-                if (instructionTextRef.current) {
-                  const progSec = (totalEffectiveMSRef.current / 1000).toFixed(1);
-                  instructionTextRef.current.text = `降壓訓練：目標 30% (±5%)，已累計有效時間：${progSec}s / ${totalDuration}s`;
-                }
-              }
-              break;
-            }
-
-            case GameMode.DUAL:
-            default: {
-              [leftTargetRef, rightTargetRef].forEach((ref, i) => {
-                const target = ref.current;
-                if (!target) return;
-
-                const isRightSide = (cfg.logic.side === 'right' || cfg.logic.side === 'both');
-                const isLeftSide = (cfg.logic.side === 'left' || cfg.logic.side === 'both');
-                target.visible = (i === 0 && isLeftSide) || (i === 1 && isRightSide);
-
-                target.x = i === 0 ? app.screen.width * 0.25 : app.screen.width * 0.75;
-                target.y = app.screen.height / 2;
-                const val = i === 0 ? prs.left : prs.right;
-                updateTargetAction(target, Math.max(0, Math.min(1, val)), cfg, app);
-
-                const success = val >= min && val <= max;
-                if (success) {
-                  const timer = i === 0 ? leftMaintenanceTimerRef : rightMaintenanceTimerRef;
-                  timer.current += app.ticker.deltaMS;
-                  // In DUAL mode, any hand in range contributes to "effective time"
-                  // But we should only add once per frame. Use a flag if needed or just sum.
-                  // For simplicity, if either (or both) succeeds, we add once.
-                  if (i === 0 || (i === 1 && !(prs.left >= min && prs.left <= max))) {
-                    totalEffectiveMSRef.current += app.ticker.deltaMS;
-                  }
-
-                  const ring = i === 0 ? leftProgressRingRef.current : rightProgressRingRef.current;
-                  updateProgressUI(target, ring, timer.current, requiredHoldTime, min, max);
-                  if (timer.current >= requiredHoldTime) {
-                    timer.current = 0;
-                    if (i === 0) {
-                      leftScoreRef.current++;
-                      if (leftScoreTextRef.current) leftScoreTextRef.current.text = `左側達成次數: ${leftScoreRef.current}`;
-                    } else {
-                      rightScoreRef.current++;
-                      if (rightScoreTextRef.current) rightScoreTextRef.current.text = `右側達成次數: ${rightScoreRef.current}`;
-                    }
-                    showSuccessFeedback(target);
-                  }
-                } else {
-                  (i === 0 ? leftMaintenanceTimerRef : rightMaintenanceTimerRef).current = 0;
-                  resetTargetTint(target, false);
-                }
-              });
-              break;
-            }
-          }
-        };
-
-        app.ticker.add(tickerCb);
-        if (stateRef.current.config) {
-          applyTheme(app, stateRef.current.config);
         }
-      } catch (err) {
-        console.error("Pixi Setup Error:", err);
+
+        // 入場期間暫停物理與計分，讓 GSAP 動畫順暢、長輩有預備時間
+        if (!entranceCompleteRef.current) {
+            return;
+        }
+
+        // Data Collection
+        totalPressureLRef.current += prs.left;
+        totalPressureRRef.current += prs.right;
+        totalSamplesRef.current += 1;
+
+        const currentMax = Math.max(prs.left, prs.right);
+        if (currentMax > maxPressureRef.current) maxPressureRef.current = Math.min(1.0, currentMax);
+        if (prs.left > maxPressureLRef.current) maxPressureLRef.current = Math.min(1.0, prs.left);
+        if (prs.right > maxPressureRRef.current) maxPressureRRef.current = Math.min(1.0, prs.right); // Timer has been removed; session lasts indefinitely until user stops it manually.
+
+        // --- 太鼓同步節拍計算 ---
+        // 顯式 opt-in:metadata.taiko_sync_pattern 為 ['left'|'right'|'both'] 陣列且非空 → 啟用同步
+        const taikoUserPattern = (cfg.metadata.taiko_sync_pattern ?? []).filter(
+            (p): p is 'left' | 'right' | 'both' => p === 'left' || p === 'right' || p === 'both'
+        );
+        const isTaikoMode = taikoUserPattern.length > 0;
+
+        if (isTaikoMode) {
+            const sync = taikoSyncRef.current;
+            if (!sync.initialized) {
+                sync.pattern = taikoUserPattern;
+                sync.patternIndex = 0;
+                sync.leftY = -200;
+                sync.rightY = -200;
+                sync.pauseUntil = 0;
+                sync.initialized = true;
+            }
+            const nowMs = performance.now();
+            if (nowMs >= sync.pauseUntil) {
+                const taikoFallSpeed = 170; // px/s,放慢以拉長反應窗口
+                const dtSec = app.ticker.deltaMS / 1000;
+                const beat = sync.pattern[sync.patternIndex];
+                if (beat === 'left' || beat === 'both') sync.leftY += taikoFallSpeed * dtSec;
+                if (beat === 'right' || beat === 'both') sync.rightY += taikoFallSpeed * dtSec;
+                // 當前拍是否完成(active 那一邊已通過底)
+                const checkY = beat === 'right' ? sync.rightY : sync.leftY;
+                if (checkY > app.screen.height + 100) {
+                    sync.patternIndex = (sync.patternIndex + 1) % sync.pattern.length;
+                    sync.leftY = -200;
+                    sync.rightY = -200;
+                    sync.consumedThisBeat.clear(); // 換拍 → 重新讓所有 drum 可被擊中
+                    // 'both' 拍後給較長休止讓玩家換氣
+                    sync.pauseUntil = nowMs + (beat === 'both' ? 700 : 400);
+                }
+            }
+        }
+
+        // --- Execute Atomic Actions ---
+        for (const ent of cfg.entities) {
+             const container = entitiesRef.current[ent.id];
+             if (!container) continue;
+
+             // MIXED 模式：隱藏的球完全跳過 (一次只出現 1 顆)
+             if (cfg.metadata.interaction_type === 'MIXED'
+                 && (ent.type === 'target' || ent.type === 'obstacle')
+                 && !container.visible) {
+                 continue;
+             }
+
+             const isPawn = ent.type === 'controllable_pawn';
+             const action = ent.movement_logic?.atomic_action;
+
+             if (getEntityRole(ent) === 'basket') {
+                 const pIds = Object.keys(allPrs || {});
+                 let playerPrs = { left: 0, right: 0 };
+                 const layout = getEntityLayout(ent);
+                 if (layout === 'left' && pIds.length > 0) {
+                     const pId = pIds[0];
+                     playerPrs = {
+                         left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
+                         right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
+                     };
+                 } else if (layout === 'right' && pIds.length > 1) {
+                     const pId = pIds[1];
+                     playerPrs = {
+                         left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
+                         right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
+                     };
+                 }
+
+                 const threshold = 0.2;
+                 const leftActive = playerPrs.left > threshold;
+                 const rightActive = playerPrs.right > threshold;
+
+                 if (leftActive && rightActive) {
+                     const avg = (playerPrs.left + playerPrs.right) / 2;
+                     container.scale.set(1 + avg * 0.8);
+                     container.rotation += (0 - container.rotation) * 0.2;
+                 } else if (leftActive) {
+                     container.scale.set(1 + (container.scale.x - 1) * 0.8);
+                     container.rotation += (-playerPrs.left * 0.5 - container.rotation) * 0.2;
+                 } else if (rightActive) {
+                     container.scale.set(1 + (container.scale.x - 1) * 0.8);
+                     container.rotation += (playerPrs.right * 0.5 - container.rotation) * 0.2;
+                 } else {
+                     container.scale.set(1 + (container.scale.x - 1) * 0.8);
+                     container.rotation += (0 - container.rotation) * 0.2;
+                 }
+                 continue;
+             }
+
+             if (!action) continue;
+
+             if (!entityPhysicsRef.current[ent.id]) {
+                 let initY = app.screen.height / 2;
+                 let initX = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+                 const initLayout = getEntityLayout(ent);
+
+                 if (action === 'DRIVE' || ent.type === 'obstacle' || ent.type === 'target') {
+                     // 入場動畫已將 target/obstacle 升到 screen*0.2，從該位置接續掉落以避免閃跳
+                     // 划龍舟船(team_*_all 綁定)從畫面最底端起步,符合「終點線在頂、船從岸邊出發」的語意
+                     const isTeamBoatStart = ent.type === 'controllable_pawn' && (ent.ball_binding || '').startsWith('team_');
+                     initY = (ent.type === 'obstacle' || ent.type === 'target')
+                         ? container.y
+                         : (isTeamBoatStart ? app.screen.height * 0.92 : app.screen.height * 0.8);
+                     if (ent.type === 'obstacle' || ent.type === 'target') {
+                         if (initLayout === 'right' && cfg.metadata.interaction_type === 'SEQUENCE') {
+                             initY = -600; // SEQUENCE 模式右邊錯開掉落時間
+                         } else if (initLayout === 'center') {
+                             initX = app.screen.width / 2;
+                         }
+                     }
+                 }
+                 
+                 let vy: number;
+                 let vx: number;
+                 if (ent.type === 'target') {
+                     vy = 120; // Constant downward speed
+                     vx = 0;
+                 } else if (isPawn) {
+                     vy = 0;
+                     vx = 0;
+                 } else {
+                     vy = (200 + Math.random() * 200) * (Math.random() > 0.5 ? 1 : -1);
+                     vx = (200 + Math.random() * 200) * (Math.random() > 0.5 ? 1 : -1);
+                 }
+
+                 entityPhysicsRef.current[ent.id] = { vy, vx, lastY: initY, lastX: initX, hasFired: false };
+             }
+             const phys = entityPhysicsRef.current[ent.id];
+
+             if (ent.movement_logic) {
+                 const action = ent.movement_logic.atomic_action;
+                 const axis = ent.movement_logic.axis;
+                 
+                 // --- Binding resolver ---
+                 // 新格式: "p{N}_{left|right|both}" 例: "p3_left" = 第 3 位玩家左手
+                 // 舊格式相容: "ball_1"/"p1"/"player_1" → 該玩家雙手平均;
+                 //            "left"/"right" → 全域 fallback 的單手;
+                 //            "shared"/未填 → 全域平均
+                 let actVal = 0;
+                 let entPrs = normalizedPrs;
+                 let handMode: 'left' | 'right' | 'both' = 'both';
+
+                 const binding = ent.ball_binding;
+                 const pIds = Object.keys(allPrs || {});
+
+                 if (binding) {
+                     // team_a_all / team_b_all 依 player_count 動態分隊:
+                     //   2 人 → team_a=[P1]、team_b=[P2](一人一船)
+                     //   4 人 → team_a=[P1,P2]、team_b=[P3,P4](兩人一船)
+                     //   3 人 → team_a=[P1,P2]、team_b=[P3](lopsided 但可運行)
+                     // 採 raw sum 語意:1 人隊 max=1.0,2 人隊 max=2.0,合作越多船越快。
+                     const teamMatch = binding.match(/^team_([ab])_all$/);
+                     const m = teamMatch ? null : binding.match(/^p(\d+)_(left|right|both)$/);
+                     if (teamMatch) {
+                         const splitIdx = Math.ceil(pIds.length / 2);
+                         const from = teamMatch[1] === 'a' ? 0 : splitIdx;
+                         const to = teamMatch[1] === 'a' ? splitIdx : pIds.length;
+                         let teamSum = 0;
+                         let memberCount = 0;
+                         for (let i = from; i < to; i++) {
+                             const pId = pIds[i];
+                             const pAvg = ((allPrs![pId].left / (mvcL || 1.0)) + (allPrs![pId].right / (mvcR || 1.0))) / 2;
+                             teamSum += pAvg;
+                             memberCount++;
+                         }
+                         if (memberCount > 0) {
+                             entPrs = { left: teamSum, right: teamSum };
+                             handMode = 'both';
+                         }
+                         // 沒有玩家 → 沿用 fallback
+                     } else if (m) {
+                         const idx = parseInt(m[1], 10) - 1;
+                         if (idx >= 0 && idx < pIds.length) {
+                             const pId = pIds[idx];
+                             entPrs = {
+                                 left: allPrs![pId].left / (mvcL || 1.0),
+                                 right: allPrs![pId].right / (mvcR || 1.0),
+                             };
+                             handMode = m[2] as 'left' | 'right' | 'both';
+                         }
+                         // 索引超界 → 沿用 normalizedPrs(避免 4 人配置在 2 人 session 誤控別人)
+                     } else {
+                         // 舊格式: 玩家編號(ball_N / p{N} / player_N)
+                         const legacyP = binding.match(/^(?:ball|p|player)_?(\d+)$/);
+                         if (legacyP) {
+                             const idx = parseInt(legacyP[1], 10) - 1;
+                             if (idx >= 0 && idx < pIds.length) {
+                                 const pId = pIds[idx];
+                                 entPrs = {
+                                     left: allPrs![pId].left / (mvcL || 1.0),
+                                     right: allPrs![pId].right / (mvcR || 1.0),
+                                 };
+                             }
+                         } else if (binding === 'left' || binding === 'right') {
+                             handMode = binding;
+                         }
+                         // 'shared' 或未識別 → 維持 fallback(全域平均)
+                     }
+                 }
+
+                 if (handMode === 'left') actVal = entPrs.left;
+                 else if (handMode === 'right') actVal = entPrs.right;
+                 else actVal = (entPrs.left + entPrs.right) / 2;
+
+                 if (action === 'DRIVE') {
+                     // Map pressure to Y-axis acceleration (against gravity)
+                     const gravity = (cfg.global_physics?.gravity_vector?.[1] !== undefined) ? cfg.global_physics.gravity_vector[1] : 1500; // px/s^2 down
+                     const multiplier = ent.movement_logic?.multiplier ?? 1.0;
+
+                     // 如果是障礙物且沒有綁定，就給 0 推力 (使其如水母般純靠重力或預設速度飄落)
+                     const isAutonomousObstacle = (ent.type === 'obstacle' || ent.type === 'target') && !ent.ball_binding && !ent.sector;
+                     // 划槳模式:team_*_all binding 的 pawn 改用 rising-edge impulse(不能一直握),模擬划槳節奏。
+                     // 連續按住不會持續加速 — 必須放鬆到 reset 閾值才能再次划動。
+                     const isRowing = isPawn && (ent.ball_binding || '').startsWith('team_');
+                     let thrust = isAutonomousObstacle ? 0 : actVal * 3500 * multiplier; // px/s^2 up
+                     if (isRowing) {
+                         thrust = 0; // 划槳模式不吃連續推力
+                         const strokeThreshold = 0.4;
+                         const requireResetThreshold = 0.15;
+                         if (actVal > strokeThreshold && !phys.hasFired) {
+                             phys.hasFired = true;
+                             // 一次划動 → 直接修改 vy 給向上衝量;配合下方的 damping 會自然減速,需要持續划才能前進。
+                             phys.vy -= 700 * actVal * multiplier;
+                             gsap.to(container.scale, { x: 1.15, y: 1.15, duration: 0.15, yoyo: true, repeat: 1 });
+                         } else if (actVal < requireResetThreshold && phys.hasFired) {
+                             phys.hasFired = false;
+                         }
+                     }
+                     
+                     const deltaSec = app.ticker.deltaMS / 1000;
+                     
+                     if (ent.type !== 'target' && ent.type !== 'obstacle') {
+                         if (isRowing) {
+                             // 划槳模式無重力,只有水阻尼讓 vy 自然衰減,船不會下沉
+                             phys.vy *= 0.92;
+                         } else {
+                             phys.vy += (gravity - thrust) * deltaSec;
+                             phys.vy *= 0.95; // air resistance damping
+                         }
+                         phys.lastY += phys.vy * deltaSec;
+
+                         if (phys.lastY > app.screen.height + 150) {
+                             phys.lastY = app.screen.height - 100;
+                             phys.vy = 0;
+                         }
+                         if (phys.lastY < 100) {
+                             phys.lastY = 100;
+                             phys.vy = 0;
+                         }
+                         
+                         if (cfg.metadata.interaction_type === 'MIXED' && isPawn) {
+                             // MIXED: lock paddle to assigned top/bottom slot, centered horizontally (lerp 平滑感測器抖動)
+                             container.x = lerp(container.x, app.screen.width / 2, 0.25);
+                             container.y = lerp(container.y, getMixedPawnY(getPawnPlayerSlot(ent), app.screen.height), 0.25);
+                         } else {
+                             // 平滑插值：避免壓力跳動造成畫面閃爍
+                             container.y = lerp(container.y, phys.lastY, 0.25);
+                             container.x = lerp(container.x, getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1), 0.25);
+                         }
+                     }
+                     
+                     if (axis === 'SCALE') {
+                         container.scale.set(1 + actVal * 2);
+                     }
+                 } else if (action === 'PULSE') {
+                     const threshold = 0.6;
+                     const requireResetThreshold = 0.15;
+
+                     // Require Reset Logic for Burst
+                     if (actVal > threshold && !phys.hasFired) {
+                         phys.hasFired = true;
+                         // overwrite + onComplete 強制收斂回 (1,1),避免連發 PULSE 動畫疊加導致 scale 漂移
+                         gsap.killTweensOf(container.scale);
+                         gsap.to(container.scale, {
+                             x: 2.0, y: 2.0, duration: 0.15, yoyo: true, repeat: 1,
+                             overwrite: 'auto',
+                             onComplete: () => container.scale.set(1, 1),
+                         });
+
+                         // 真正打出衝量：對同 sector + 同 layout 的 target/obstacle 施加初速
+                         // (左手只彈左、右手只彈右;layout='center' 視為共享,雙手皆可影響)
+                         const multiplier = ent.movement_logic?.multiplier ?? 1.0;
+                         const impulseY = -1200 * actVal * multiplier; // 負號 = 向上飛
+                         const pawnSector = getEntitySector(ent);
+                         const pawnLayout = getEntityLayout(ent);
+                         for (const otherEnt of cfg.entities) {
+                             if (otherEnt.type !== 'target' && otherEnt.type !== 'obstacle') continue;
+                             const otherSector = getEntitySector(otherEnt);
+                             // sector 不匹配且雙方都不是 shared → 不影響別人的球
+                             if (pawnSector !== 'shared' && otherSector !== 'shared' && pawnSector !== otherSector) continue;
+                             // layout 都明確且不同 → skip(左手不彈右側鼓)
+                             const otherLayout = getEntityLayout(otherEnt);
+                             const pawnSideExplicit = pawnLayout === 'left' || pawnLayout === 'right';
+                             const otherSideExplicit = otherLayout === 'left' || otherLayout === 'right';
+                             if (pawnSideExplicit && otherSideExplicit && pawnLayout !== otherLayout) continue;
+                             const otherPhys = entityPhysicsRef.current[otherEnt.id];
+                             if (otherPhys) {
+                                 otherPhys.vy = impulseY;
+                                 // 視覺回饋：被擊中物件閃爍縮放
+                                 const otherC = entitiesRef.current[otherEnt.id];
+                                 if (otherC) {
+                                     gsap.killTweensOf(otherC.scale);
+                                     gsap.to(otherC.scale, {
+                                         x: 1.3, y: 1.3, duration: 0.1, yoyo: true, repeat: 1,
+                                         overwrite: 'auto',
+                                         onComplete: () => otherC.scale.set(1, 1),
+                                     });
+                                 }
+                             }
+                         }
+                     } else if (actVal < requireResetThreshold && phys.hasFired) {
+                         phys.hasFired = false; // Reset complete
+                     }
+                 } else if (action === 'NAVIGATE') {
+                     const diff = entPrs.right - entPrs.left;
+                     if (isNaN(diff)) continue;
+                     const rawTargetX = app.screen.width / 2 + (diff * (app.screen.width * 0.4));
+                     // 球板半寬（含描邊）+ 邊緣裕度，避免移動過快超出畫面
+                     const halfPawn = 75 + 6;
+                     const minX = halfPawn;
+                     const maxX = app.screen.width - halfPawn;
+                     const targetX = Math.max(minX, Math.min(maxX, rawTargetX));
+                     // Smooth interpolation for X-axis mapping
+                     container.x += (targetX - container.x) * 0.2;
+                     container.x = Math.max(minX, Math.min(maxX, container.x));
+
+                     if (cfg.metadata.interaction_type === 'MIXED' && isPawn) {
+                         // MIXED: lock paddle to its assigned top/bottom slot (lerp 平滑度假感)
+                         container.y = lerp(container.y, getMixedPawnY(getPawnPlayerSlot(ent), app.screen.height), 0.25);
+                     } else if (cfg.metadata.interaction_type === 'SEQUENCE' && isPawn && getEntityRole(ent) === 'basket') {
+                         container.y = lerp(container.y, app.screen.height * 0.75, 0.25);
+                     } else {
+                         container.y = lerp(container.y, app.screen.height / 2, 0.25);
+                     }
+                 } else if (action === 'SEQUENCE' && isPawn) {
+                     const threshold = 0.5;
+                     const requireResetThreshold = 0.15;
+                     if (actVal > threshold && !phys.hasFired) {
+                         phys.hasFired = true;
+                         // 捏的瞬間放大，提示玩家已出力
+                         gsap.to(container.scale, { x: 1.5, y: 1.5, duration: 0.15, yoyo: true, repeat: 1 });
+                     } else if (actVal < requireResetThreshold && phys.hasFired) {
+                         phys.hasFired = false;
+                     }
+                 }
+                 
+                 // --- Unified Target Drop Logic ---
+                 // 強制所有 target / obstacle 啟動掉落物理，忽略 AI 錯誤配置的 fallback
+                 if (ent.type === 'target' || ent.type === 'obstacle') {
+                     const deltaSec = app.ticker.deltaMS / 1000;
+                     const isMixedDrop = cfg.metadata.interaction_type === 'MIXED';
+
+                     // 划龍舟模式:DRIVE + 有 team_*_all 綁定的船 → finish_line 固定在頂端不掉落
+                     const isTeamRace = cfg.metadata.interaction_type === 'DRIVE' &&
+                         (cfg.entities ?? []).some(e => e.type === 'controllable_pawn' && (e.ball_binding || '').startsWith('team_'));
+                     if (isTeamRace && ent.type === 'target') {
+                         const targetY = app.screen.height * 0.12;
+                         phys.lastY = targetY;
+                         phys.vy = 0;
+                         container.y = lerp(container.y, targetY, 0.15);
+                         container.x = lerp(container.x, getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1), 0.25);
+                         continue;
+                     }
+
+                     // 太鼓同步:同 layout 的 target 共用 sync.leftY/rightY,X 仍照 sector+layout 各自分欄
+                     if (isTaikoMode && ent.type === 'target') {
+                         const lay = getEntityLayout(ent);
+                         if (lay === 'left' || lay === 'right') {
+                             const sync = taikoSyncRef.current;
+                             // 本拍被擊中過 → 隱藏(下一拍重置時 consumedThisBeat 會 clear)
+                             if (sync.consumedThisBeat.has(ent.id)) {
+                                 container.visible = false;
+                             } else {
+                                 container.visible = true;
+                                 const groupY = lay === 'left' ? sync.leftY : sync.rightY;
+                                 phys.lastY = groupY;
+                                 phys.vy = 0;
+                                 container.y = groupY;
+                                 container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+                             }
+                             continue;
+                         }
+                     }
+
+                     if (isMixedDrop) {
+                         // 平面玩：2D 等速運動，四面牆反彈，不重生
+                         const speed = 320;
+                         if (phys.vx === undefined || phys.vy === undefined || (phys.vx === 0 && phys.vy === 0)) {
+                             // 避開 0.5π 附近（純垂直）造成的「上下狂跳、水平龜速」
+                             // 兩段區間：[0.1π, 0.4π] ∪ [0.6π, 0.9π]，水平分量保證 ≥ sin(0.1π)·speed ≈ 99 px/s
+                             const half = Math.random() * 0.3 + 0.1; // 0.1 ~ 0.4
+                             const angle = (Math.random() < 0.5 ? half : 1 - half) * Math.PI;
+                             phys.vx = Math.cos(angle) * speed * (Math.random() < 0.5 ? -1 : 1);
+                             phys.vy = Math.sin(angle) * speed;
+                         }
+                         phys.lastX += phys.vx * deltaSec;
+                         phys.lastY += phys.vy * deltaSec;
+
+                         const radius = 50 * (ballScaleRef.current[ent.id] ?? 0.5);
+                         if (phys.lastX < radius) { phys.lastX = radius; phys.vx = Math.abs(phys.vx); }
+                         else if (phys.lastX > app.screen.width - radius) { phys.lastX = app.screen.width - radius; phys.vx = -Math.abs(phys.vx); }
+                         if (phys.lastY < radius) { phys.lastY = radius; phys.vy = Math.abs(phys.vy); }
+                         else if (phys.lastY > app.screen.height - radius) { phys.lastY = app.screen.height - radius; phys.vy = -Math.abs(phys.vy); }
+
+                         container.x = phys.lastX;
+                         container.y = phys.lastY;
+
+                         // 同步球顏色與大小（碰球板不變大小，僅反彈與變色）
+                         const tint = MIXED_BALL_COLORS[ballColorRef.current[ent.id] || 'blue'];
+                         container.children.forEach((c: any) => { if ('tint' in c) c.tint = tint; });
+                         container.scale.set(ballScaleRef.current[ent.id] ?? 0.5);
+                     } else {
+                         // 其他模式：等速下墜 + 從上方重生
+                         // SEQUENCE 模式刻意放慢，給玩家足夠時間看清楚下一步該誰接
+                         const baseFallSpeed = cfg.metadata.interaction_type === 'SEQUENCE' ? 100 : 180;
+                         // PULSE 衝量會把 vy 設為負(向上)。若仍是負，套重力讓它自然落回；
+                         // 落回 baseFallSpeed 後就回到等速下墜，避免無限加速。
+                         if (phys.vy === undefined || phys.vy >= 0) {
+                             phys.vy = baseFallSpeed;
+                         } else {
+                             const gravity = 600;
+                             phys.vy = Math.min(phys.vy + gravity * deltaSec, baseFallSpeed);
+                         }
+                         phys.lastY += phys.vy * deltaSec;
+
+                         // SEQUENCE 模式：
+                         //   單一 target → X 跟 sequenceStep 在左右交替（記憶輪替訓練）
+                         //   多 target  → 各 target 鎖在自己 sector 的欄位（多重目標混淆訓練,3-4 人由 getLayoutX 自動分欄）
+                         const isSequenceTarget = cfg.metadata.interaction_type === 'SEQUENCE' && ent.type === 'target';
+                         const targetCount = cfg.entities.filter(e => e.type === 'target').length;
+                         const targetSector = getEntitySector(ent);
+                         const hasOwnSector = targetSector === 'p1' || targetSector === 'p2' || targetSector === 'p3' || targetSector === 'p4';
+                         const seqPlayerCount = cfg.metadata.player_count ?? 2;
+
+                         let sequenceTargetX: number;
+                         if (isSequenceTarget && targetCount > 1 && hasOwnSector) {
+                             if (seqPlayerCount >= 3) {
+                                 // 3-4 人:用欄位中心
+                                 sequenceTargetX = getLayoutX(ent, app.screen.width, seqPlayerCount);
+                             } else {
+                                 // 2 人:沿用 p1=25%, p2=75%
+                                 sequenceTargetX = targetSector === 'p2'
+                                     ? app.screen.width * 0.75
+                                     : app.screen.width * 0.25;
+                             }
+                         } else {
+                             sequenceTargetX = sequenceStepRef.current === 2
+                                 ? app.screen.width * 0.75
+                                 : app.screen.width * 0.25;
+                         }
+
+                         if (phys.lastY > app.screen.height + 150) {
+                             phys.lastY = -200;
+                             phys.lastX = isSequenceTarget ? sequenceTargetX : getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+                         }
+
+                         if (isSequenceTarget) {
+                             // 平滑滑向目標 X，避免接到後瞬間瞬移
+                             phys.lastX = lerp(phys.lastX, sequenceTargetX, 0.08);
+                         }
+
+                         container.y = phys.lastY;
+                         container.x = phys.lastX;
+                     }
+                 }
+                 
+                 // Sync physics X/Y for pawns
+                 if (isPawn) {
+                     phys.lastX = container.x;
+                     phys.lastY = container.y;
+                 }
+             }
+
+             // --- Generic Physics (Bouncing) for non-pawns ---
+             const isFallingObject = ent.type === 'target' || ent.type === 'obstacle';
+             if (!isPawn && ent.movement_logic?.atomic_action !== 'DRIVE' && !isFallingObject) {
+                 const dt = app.ticker.deltaMS / 1000;
+                 phys.lastX += (phys.vx || 0) * dt;
+                 phys.lastY += (phys.vy || 0) * dt;
+                 
+                 const halfW = (container.width || 100) / 2;
+                 const halfH = (container.height || 100) / 2;
+                 
+                 // Screen bounds bounce
+                 if (phys.lastX < halfW) { phys.lastX = halfW; phys.vx *= -1; }
+                 if (phys.lastX > app.screen.width - halfW) { phys.lastX = app.screen.width - halfW; phys.vx *= -1; }
+                 if (phys.lastY < halfH) { phys.lastY = halfH; phys.vy *= -1; }
+                 if (phys.lastY > app.screen.height - halfH) { phys.lastY = app.screen.height - halfH; phys.vy *= -1; }
+                 
+                 container.x = phys.lastX;
+                 container.y = phys.lastY;
+             }
+
+             // Handle calibration UI override
+             if (isCalibration) {
+                 container.x = app.screen.width / 2;
+                 container.scale.set(1 + ((normalizedPrs.left + normalizedPrs.right) / 2) * 2);
+             }
+        }
+        
+        // Update Sequence Bulbs globally
+        if (sequenceBulbsRef.current.length === 2) {
+            const currentStep = sequenceStepRef.current;
+            sequenceBulbsRef.current[0].alpha = currentStep === 1 ? 1.0 : 0.2;
+            sequenceBulbsRef.current[1].alpha = currentStep === 2 ? 1.0 : 0.2;
+        }
+        
+        // --- MIXED 模式專用碰撞 (球板 vs 球，依顏色匹配計分) ---
+        if (cfg.metadata.interaction_type === 'MIXED') {
+            const now = performance.now();
+            const allEnts = Object.values(entitiesRef.current) as any[];
+            const pawns = allEnts.filter(c => c.type === 'controllable_pawn' && c.visible);
+            const balls = allEnts.filter(c => (c.type === 'target' || c.type === 'obstacle') && c.visible);
+
+            const updateMixedScoreText = () => {
+                if (!instructionTextRef.current) return;
+                const actPIds = Object.keys(allPrs || {});
+                let scoreStr = `分數: ${Math.max(0, scoreRefs.current.global)}`;
+                if (actPIds.length > 1) {
+                    const playerN = Math.min(4, Math.max(actPIds.length, cfg.metadata.player_count ?? 2));
+                    const parts: string[] = [];
+                    for (let i = 1; i <= playerN; i++) {
+                        const key = ('p' + i) as 'p1' | 'p2' | 'p3' | 'p4';
+                        parts.push(`P${i}: ${Math.max(0, scoreRefs.current[key])}`);
+                    }
+                    scoreStr = `多人分數 - ${parts.join(' | ')}`;
+                }
+                instructionTextRef.current.text = `[${cfg.metadata.game_name}] 模式: ${cfg.metadata.interaction_type} | ${scoreStr}`;
+            };
+
+            pawns.forEach(pawn => {
+                balls.forEach(ball => {
+                    const key = `mixed_${pawn.id}_${ball.id}`;
+                    const last = collisionCooldownRef.current[key] || 0;
+                    if (now - last < 500) return;
+
+                    // 圓 (球) vs AABB (球板) 精確碰撞
+                    const pb = pawn.getBounds();
+                    const ballRadius = 50 * (ballScaleRef.current[ball.id] ?? 0.5);
+                    const nearestX = Math.max(pb.x, Math.min(ball.x, pb.x + pb.width));
+                    const nearestY = Math.max(pb.y, Math.min(ball.y, pb.y + pb.height));
+                    const dx = ball.x - nearestX;
+                    const dy = ball.y - nearestY;
+                    if (dx * dx + dy * dy >= ballRadius * ballRadius) return;
+
+                    collisionCooldownRef.current[key] = now;
+
+                    const pawnCol = pawnSlotToBallColor(getPawnPlayerSlot(pawn));
+                    const ballCol = ballColorRef.current[ball.id] || 'blue';
+                    const ballPhys = entityPhysicsRef.current[ball.id];
+
+                    const pawnSector = getEntitySector(pawn);
+                    if (pawnCol === ballCol) {
+                        // 接到對的顏色：+1，球變另一色
+                        scoreRefs.current.global += 1;
+                        if (pawnSector === 'p1') scoreRefs.current.p1 += 1;
+                        else if (pawnSector === 'p2') scoreRefs.current.p2 += 1;
+                        else if (pawnSector === 'p3') scoreRefs.current.p3 += 1;
+                        else if (pawnSector === 'p4') scoreRefs.current.p4 += 1;
+                        ballColorRef.current[ball.id] = flipBallColor(ballCol);
+                        gsap.to(pawn.scale, { x: 1.25, y: 1.25, duration: 0.12, yoyo: true, repeat: 1 });
+                    } else {
+                        // 接到錯的顏色：-1（碰到球板不改變球大小）
+                        scoreRefs.current.global -= 1;
+                        if (pawnSector === 'p1') scoreRefs.current.p1 -= 1;
+                        else if (pawnSector === 'p2') scoreRefs.current.p2 -= 1;
+                        else if (pawnSector === 'p3') scoreRefs.current.p3 -= 1;
+                        else if (pawnSector === 'p4') scoreRefs.current.p4 -= 1;
+                        gsap.to(ball, { rotation: '+=0.8', duration: 0.18, yoyo: true, repeat: 1 });
+                    }
+
+                    // 反彈：依球與球板相對位置反射 vy，並小幅擾動 vx (球大小維持)
+                    if (ballPhys) {
+                        if (ball.y < pawn.y) ballPhys.vy = -Math.abs(ballPhys.vy);
+                        else ballPhys.vy = Math.abs(ballPhys.vy);
+                        ballPhys.vx += (Math.random() - 0.5) * 120;
+                    }
+
+                    updateMixedScoreText();
+                });
+            });
+        }
+
+        // --- Collision Handling (非 MIXED 模式) ---
+        if (cfg.metadata.interaction_type !== 'MIXED' && cfg.collision_handlers) {
+            const now = performance.now();
+            cfg.collision_handlers.forEach(handler => {
+               if (!handler.between || handler.between.length < 2) return;
+               const idA = handler.between[0];
+               const idB = handler.between[1];
+               const entA = entitiesRef.current[idA];
+               const entB = entitiesRef.current[idB];
+               
+               if (!entA || !entB || !entA.visible || !entB.visible) return;
+               
+               const avgPressure = (normalizedPrs.left + normalizedPrs.right) / 2;
+
+               // --- 針對接物籃 (basket) 的專門壓力檢查：若未出力，則不觸發接取！ ---
+               const pawnEnt = entA.type === 'controllable_pawn' ? entA : (entB.type === 'controllable_pawn' ? entB : null);
+               const pawnEntLayout = pawnEnt ? getEntityLayout(pawnEnt) : 'center';
+               if (pawnEnt && getEntityRole(pawnEnt) === 'basket') {
+                   const pIds = Object.keys(allPrs || {});
+                   let pickerPrs = normalizedPrs;
+                   if (pawnEntLayout === 'left' && pIds.length > 0) {
+                       const pId = pIds[0];
+                       pickerPrs = {
+                           left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
+                           right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
+                       };
+                   } else if (pawnEntLayout === 'right' && pIds.length > 1) {
+                       const pId = pIds[1];
+                       pickerPrs = {
+                           left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
+                           right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
+                       };
+                   }
+
+                   // 任一手或雙手皆可觸發接取（與視覺邏輯一致）
+                   const maxHand = Math.max(pickerPrs.left, pickerPrs.right);
+                   if (maxHand < 0.2) {
+                       return; // 若雙手都未達門檻，視為沒接，香菇穿透不觸發碰撞。
+                   }
+               }
+
+               // --- 強制 SEQUENCE 輪替防呆機制 ---
+               // 只阻擋對 target 的「錯方接取」，但允許 obstacle 觸發懲罰(壓力陷阱設計)
+               const otherEnt = pawnEnt === entA ? entB : entA;
+               const isTargetCollision = otherEnt?.type === 'target';
+               if (pawnEnt && isTargetCollision && cfg.metadata.interaction_type === 'SEQUENCE') {
+                   const seqTargetCount = cfg.entities.filter(e => e.type === 'target').length;
+                   if (seqTargetCount > 1) {
+                       // 多重目標：要求 sector 匹配。撈到別人的魚不予計分
+                       const pawnSec = getEntitySector(pawnEnt);
+                       const targetSec = otherEnt ? getEntitySector(otherEnt) : 'shared';
+                       if (pawnSec !== 'shared' && targetSec !== 'shared' && pawnSec !== targetSec) {
+                           return;
+                       }
+                   } else {
+                       // 單一目標：依輪替燈號限制
+                       if (sequenceStepRef.current === 1 && pawnEntLayout === 'right') {
+                           return; // 左燈亮時，右邊的人不能接金魚
+                       }
+                       if (sequenceStepRef.current === 2 && pawnEntLayout === 'left') {
+                           return; // 右燈亮時，左邊的人不能接金魚
+                       }
+                   }
+               }
+
+               // DODGE_PHASE early-exit penetration lock
+               if (handler.on_match_logic === 'DODGE_PHASE' && avgPressure < 0.05) {
+                   return; // Do not trigger collision logic; objects bypass natively
+               }
+               
+               const pad = 10;
+               const b1 = entA.getBounds();
+               const b2 = entB.getBounds();
+               const isOverlapping = (b1.x - pad) < (b2.x + b2.width + pad) && 
+                                     (b1.x + b1.width + pad) > (b2.x - pad) &&
+                                     (b1.y - pad) < (b2.y + b2.height + pad) && 
+                                     (b1.y + b1.height + pad) > (b2.y - pad);
+                                     
+               if (isOverlapping) {
+                   const collisionKey = `${idA}_${idB}`;
+                   const lastTime = collisionCooldownRef.current[collisionKey] || 0;
+                   if (now - lastTime > 500) { // 500ms cooldown for responsive bounces
+                       collisionCooldownRef.current[collisionKey] = now;
+
+                       // Collision visual feedback:對「靜止方」打 scale 閃爍取代 y 偏移,
+                       // 避免 gsap.to(.y, yoyo) 多次連發時 yoyo 起點漂移、累積成 pawn 緩慢下沉/上飄。
+                       const flashScale = (c: any) => {
+                           if (!c) return;
+                           gsap.killTweensOf(c.scale);
+                           gsap.to(c.scale, {
+                               x: 1.15, y: 1.15, duration: 0.05, yoyo: true, repeat: 1,
+                               overwrite: 'auto',
+                               onComplete: () => c.scale.set(1, 1),
+                           });
+                       };
+                       if (!entityPhysicsRef.current[idA] || entityPhysicsRef.current[idA].vy === 0) flashScale(entA);
+                       if (!entityPhysicsRef.current[idB] || entityPhysicsRef.current[idB].vy === 0) flashScale(entB);
+                                            if (handler.on_match_logic === 'DODGE_PHASE') {
+                            // If reached here, pressure is >= 0.05 (hit occurred)
+                            const sA = getEntitySector(entA);
+                            scoreRefs.current.global -= 1;
+                            if (sA === 'p1') scoreRefs.current.p1 -= 1;
+                            else if (sA === 'p2') scoreRefs.current.p2 -= 1;
+                            else if (sA === 'p3') scoreRefs.current.p3 -= 1;
+                            else if (sA === 'p4') scoreRefs.current.p4 -= 1;
+                            gsap.to(entA.scale, { x: 1.1, y: 1.1, duration: 0.1, yoyo: true, repeat: 1 });
+                        } else if (handler.on_match_logic === 'SCORE_HIT') {
+                            const sectors = new Set([getEntitySector(entA), getEntitySector(entB)]);
+                            scoreRefs.current.global += 1;
+                            if (sectors.has('p1')) scoreRefs.current.p1 += 1;
+                            if (sectors.has('p2')) scoreRefs.current.p2 += 1;
+                            if (sectors.has('p3')) scoreRefs.current.p3 += 1;
+                            if (sectors.has('p4')) scoreRefs.current.p4 += 1;
+                            gsap.to(entA.scale, { x: 1.1, y: 1.1, duration: 0.1, yoyo: true, repeat: 1 });
+                            gsap.to(entB.scale, { x: 1.1, y: 1.1, duration: 0.1, yoyo: true, repeat: 1 });
+                            // 太鼓同步:擊中即標記 consumed,本拍剩餘時間隱藏該 drum
+                            if (taikoSyncRef.current.initialized) {
+                                const targetEntInPair = entA.type === 'target' ? entA : (entB.type === 'target' ? entB : null);
+                                if (targetEntInPair) taikoSyncRef.current.consumedThisBeat.add(targetEntInPair.id);
+                            }
+                         } else if (handler.on_match_logic === 'RANDOM_RECOLOR') {
+                             const sectors = new Set([getEntitySector(entA), getEntitySector(entB)]);
+                             scoreRefs.current.global += 1;
+                             if (sectors.has('p1')) scoreRefs.current.p1 += 1;
+                             if (sectors.has('p2')) scoreRefs.current.p2 += 1;
+                             if (sectors.has('p3')) scoreRefs.current.p3 += 1;
+                             if (sectors.has('p4')) scoreRefs.current.p4 += 1;
+                             const newColor = Math.random() * 0xFFFFFF;
+                             const basketEnt = getEntityRole(entA) === 'basket' ? entA : (getEntityRole(entB) === 'basket' ? entB : null);
+
+                             // 籃子閃一下新色，0.25s 後還原（蘑菇不變色）
+                             if (basketEnt) {
+                                 const originalTints: number[] = basketEnt.children.map((c: any) => ('tint' in c ? c.tint : 0xFFFFFF));
+                                 basketEnt.children.forEach((c: any) => { if ('tint' in c) c.tint = newColor; });
+                                 gsap.delayedCall(0.25, () => {
+                                     basketEnt.children.forEach((c: any, i: number) => {
+                                         if ('tint' in c) c.tint = originalTints[i];
+                                     });
+                                 });
+
+                                 // 碰撞回饋強化：basket 大幅跳躍 + 縮放，讓長輩明確知道接到
+                                 const baseY = basketEnt.y;
+                                 gsap.fromTo(basketEnt, { y: baseY }, { y: baseY - 80, duration: 0.18, ease: 'power2.out', yoyo: true, repeat: 1 });
+                                 gsap.fromTo(basketEnt.scale, { x: 1, y: 1 }, { x: 1.3, y: 1.3, duration: 0.18, yoyo: true, repeat: 1 });
+                             }
+                             
+                             // 將被接到的香菇瞬間移到畫面最下方，觸發重生，避免在籃子內停留多次觸發換燈
+                             const targetEnt = entA.type === 'target' ? entA : (entB.type === 'target' ? entB : null);
+                             if (targetEnt && entityPhysicsRef.current[targetEnt.id]) {
+                                 entityPhysicsRef.current[targetEnt.id].lastY = app.screen.height + 200;
+                             }
+                         } else if (handler.on_match_logic === 'GAME_WIN') {
+                             // GAME_WIN 觸發時先計分,再判定是否達標 — 否則 target_score >= 1 永遠卡住(因為碰撞前分數還是 0)
+                             const winSectors = new Set([getEntitySector(entA), getEntitySector(entB)]);
+                             scoreRefs.current.global += 1;
+                             if (winSectors.has('p1')) scoreRefs.current.p1 += 1;
+                             if (winSectors.has('p2')) scoreRefs.current.p2 += 1;
+                             if (winSectors.has('p3')) scoreRefs.current.p3 += 1;
+                             if (winSectors.has('p4')) scoreRefs.current.p4 += 1;
+                             const targetScore = cfg.scoring_metrics?.target_score;
+                             if (targetScore === undefined || scoreRefs.current.global >= targetScore) {
+                                 if (instructionTextRef.current) {
+                                     instructionTextRef.current.text = `🏆 達成目標！最終分數：${scoreRefs.current.global}`;
+                                 }
+                                 sessionEndedRef.current = false;
+                                 const totalDuration = (performance.now() - sessionStartTimeRef.current) / 1000;
+                                 onSessionEnd({
+                                     effectiveSeconds: totalEffectiveMSRef.current / 1000,
+                                     totalSeconds: totalDuration,
+                                     avgPressureL: totalPressureLRef.current / Math.max(1, totalSamplesRef.current),
+                                     avgPressureR: totalPressureRRef.current / Math.max(1, totalSamplesRef.current),
+                                     maxPressure: maxPressureRef.current,
+                                     maxPressureL: maxPressureLRef.current,
+                                     maxPressureR: maxPressureRRef.current,
+                                     compensationOccurred: false,
+                                     clinical_tags: collectClinicalTags(cfg),
+                                 });
+                                 sessionEndedRef.current = true;
+                             }
+                         }
+
+                         // SEQUENCE 模式：成功接取後依 pattern 推進（記憶訓練）
+                         if (cfg.metadata.interaction_type === 'SEQUENCE' && pawnEnt &&
+                             handler.on_match_logic !== 'DODGE_PHASE' && handler.on_match_logic !== 'NONE') {
+                             const pattern = sequencePatternRef.current;
+                             if (pattern.length > 0) {
+                                 sequenceIndexRef.current = (sequenceIndexRef.current + 1) % pattern.length;
+                                 sequenceStepRef.current = pattern[sequenceIndexRef.current];
+                             }
+                         }
+                         
+                         if (handler.penalty_logic === 'DEDUCT_SCORE') {
+                            const penaltySectors = new Set([getEntitySector(entA), getEntitySector(entB)]);
+                            scoreRefs.current.global -= 1;
+                            if (penaltySectors.has('p1')) scoreRefs.current.p1 -= 1;
+                            if (penaltySectors.has('p2')) scoreRefs.current.p2 -= 1;
+                            if (penaltySectors.has('p3')) scoreRefs.current.p3 -= 1;
+                            if (penaltySectors.has('p4')) scoreRefs.current.p4 -= 1;
+                         } else if (handler.penalty_logic === 'HAPTIC_LONG_VIBRATE') {
+                            console.log(`[HAPTIC] 觸發強烈震動回饋！來自物件碰撞：${idA} 與 ${idB}`);
+                            if (navigator.vibrate) navigator.vibrate([500, 200, 500]);
+                         }
+                         
+                         if (instructionTextRef.current) {
+                             const actPIds = Object.keys(allPrs || {});
+                             let scoreStr = `分數: ${Math.max(0, scoreRefs.current.global)}`;
+                             if (actPIds.length > 1) {
+                                 const playerN = Math.min(4, Math.max(actPIds.length, cfg.metadata.player_count ?? 2));
+                                 const parts: string[] = [];
+                                 for (let i = 1; i <= playerN; i++) {
+                                     const key = ('p' + i) as 'p1' | 'p2' | 'p3' | 'p4';
+                                     parts.push(`P${i}: ${Math.max(0, scoreRefs.current[key])}`);
+                                 }
+                                 scoreStr = `多人分數 - ${parts.join(' | ')}`;
+                             }
+                             instructionTextRef.current.text = `[${cfg.metadata.game_name}] 模式: ${cfg.metadata.interaction_type} | ${scoreStr}`;
+                         }
+                    }
+                }
+             });
+         }
+        
+      };
+
+      app.ticker.add(tickerCb);
+      tickerCbRef.current = tickerCb;
+
+      if (stateRef.current.config) {
+        applyTheme(app, stateRef.current.config);
       }
     };
-
     setup();
 
     return () => {
@@ -925,7 +1467,10 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, isActive, onSessi
       const g = globalThis as any;
       const app = g[PIXI_GLOBAL_KEY] as PIXI.Application;
       if (app) {
-        if (tickerCb) app.ticker.remove(tickerCb);
+        if (tickerCbRef.current) {
+          app.ticker.remove(tickerCbRef.current);
+          tickerCbRef.current = null;
+        }
         if (sessionContainerRef.current) {
           app.stage.removeChild(sessionContainerRef.current);
           sessionContainerRef.current.destroy({ children: true });
@@ -943,35 +1488,48 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, isActive, onSessi
     if (app && config) {
       applyTheme(app, config);
     }
+
+    // --- 設定健檢:警告 collision_handlers 參考到不存在的 entity id ---
+    if (config?.collision_handlers && config?.entities) {
+      const validIds = new Set(config.entities.map(e => e.id));
+      const issues: string[] = [];
+      config.collision_handlers.forEach((h, idx) => {
+        if (!h.between || h.between.length < 2) {
+          issues.push(`handler[${idx}] between 缺少兩個 id`);
+          return;
+        }
+        const [a, b] = h.between;
+        if (!validIds.has(a)) issues.push(`handler[${idx}] between[0]="${a}" 在 entities 中找不到(疑似誤用 type 名稱)`);
+        if (!validIds.has(b)) issues.push(`handler[${idx}] between[1]="${b}" 在 entities 中找不到`);
+      });
+      if (issues.length > 0) {
+        console.warn(`[AUGP 設定健檢] collision_handlers 有 ${issues.length} 個問題,以下 handler 不會生效:\n  - ` + issues.join('\n  - '));
+      }
+    }
   }, [config]);
 
-  // Session Monitoring
-  const sessionStartTimeRef = useRef<number>(0);
-  const sessionEndedRef = useRef<boolean>(false);
-  const totalEffectiveMSRef = useRef<number>(0);
-  const totalPressureLRef = useRef<number>(0);
-  const totalPressureRRef = useRef<number>(0);
-  const totalSamplesRef = useRef<number>(0);
-  const compensationCountRef = useRef<number>(0);
-  const progressBarRef = useRef<PIXI.Graphics | null>(null);
-  const timerTextRef = useRef<PIXI.Text | null>(null);
-
+  // Automatically submit metrics when isActive toggles from true to false
   useEffect(() => {
-    if (isActive) {
-      sessionStartTimeRef.current = performance.now();
-      totalEffectiveMSRef.current = 0;
-      sessionEndedRef.current = false;
-      totalPressureLRef.current = 0;
-      totalPressureRRef.current = 0;
-      totalSamplesRef.current = 0;
-      compensationCountRef.current = 0;
-      maxPressureRef.current = 0;
+    if (!isActive && totalSamplesRef.current > 0 && !sessionEndedRef.current) {
+      sessionEndedRef.current = true;
+      const totalDuration = (performance.now() - sessionStartTimeRef.current) / 1000;
+      onSessionEnd({
+        effectiveSeconds: totalEffectiveMSRef.current / 1000,
+        totalSeconds: totalDuration,
+        avgPressureL: totalPressureLRef.current / Math.max(1, totalSamplesRef.current),
+        avgPressureR: totalPressureRRef.current / Math.max(1, totalSamplesRef.current),
+        maxPressure: maxPressureRef.current,
+        maxPressureL: maxPressureLRef.current,
+        maxPressureR: maxPressureRRef.current,
+        compensationOccurred: false,
+        clinical_tags: collectClinicalTags(stateRef.current.config),
+      });
     }
-  }, [isActive]);
+  }, [isActive, onSessionEnd]);
 
   return (
-    <div ref={containerRef} className="w-full h-full rounded-xl overflow-hidden bg-black flex items-center justify-center">
-      <div className="text-zinc-800 animate-pulse">
+    <div ref={containerRef} className="w-full h-full rounded-xl overflow-hidden bg-amber-950 flex items-center justify-center">
+      <div className="text-amber-800 animate-pulse">
         {isActive ? '運作中...' : '渲染引擎就緒'}
       </div>
     </div>
