@@ -304,6 +304,13 @@ const MECHANIC_FORBIDS: Record<string, string[]> = {
   TEAM_COOP_RACE: [
     "嚴禁加入 obstacle,本機制只有兩隊船/車與兩條 finish_line",
   ],
+  DUAL_TASK: [
+    "controllable_pawn 的 `movement_logic.atomic_action` 必為 `\"PULSE\"`(左手 paddle 與右手 basket 皆是);**禁止使用 `\"NAVIGATE\"`** — NAVIGATE 預設 ball_binding 是 `p{N}_both`,綁單手(`p{N}_left` / `p{N}_right`)會無效。",
+    "target 與 obstacle 的 `role` 必為 `\"decoration\"`;**禁止使用 `\"mushroom\"` / `\"obstacle\"` 這兩個 role** — 它們不會被 themed 主題圖覆蓋,會固定渲染成紅圓/灰圈X。",
+    "obstacle 的 `layout` 必為 `\"left\"`,target 的 `layout` 必為 `\"right\"`;**禁止用 `\"center\"`** — center 會掉在欄位中央,paddle/basket 都接不到。",
+    "每位玩家(p1~pN)都要有「左手 paddle(role=paddle, ball_binding=p{N}_left, layout=left)」+「右手 basket(role=basket, ball_binding=p{N}_right, layout=right)」這對 pawn,以及對應的 obstacle 與 target。",
+    "collision_handlers 必須含「左手 paddle × obstacle → DEDUCT_SCORE」與「右手 basket × target → SCORE_HIT」兩種配對,缺一不可。",
+  ],
   GROUP_RHYTHM: [
     "不要混用 `sector: \"shared\"` 的 target(會脫離同步分組);共用障礙物可保 layout=center",
   ],
