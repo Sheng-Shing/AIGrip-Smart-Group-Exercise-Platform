@@ -379,20 +379,25 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
           // MIXED: stack paddles vertically, P1 top / P2 bottom
           container.x = app.screen.width / 2;
           container.y = getMixedPawnY(getPawnPlayerSlot(ent), app.screen.height);
-        } else if (cfg.metadata.interaction_type === 'SEQUENCE' && isPawnEnt && getEntityRole(ent) === 'basket') {
-          // SEQUENCE: basket 放在螢幕下方 75%，方便接從上方落下的 target
-          container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
+        } else if (cfg.metadata.interaction_type === 'SEQUENCE' && isPawnEnt) {
+          // SEQUENCE: 所有 controllable_pawn(籃子/網/接物器)放在螢幕下方 75%、X 鎖在 sector 欄位中心,
+          // 與落下的 target 共線(target 在 ticker 中也 snap 到欄位中心),確保視覺對齊。
+          // 不分 role=basket/paddle/mushroom — AI 在 SEQUENCE_TURN 場景下這幾種 role 都被當接物器使用。
+          container.x = getLayoutX({ ...ent, layout: 'center' }, app.screen.width, cfg.metadata.player_count ?? 1);
           container.y = app.screen.height * 0.75;
         } else {
           container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
           // 划龍舟船(team_*_all 綁定)從畫面最底端起步,入場動畫的 targetY 也跟著用 0.92
           // PULSE/NAVIGATE 等 pawn(打太鼓槌子、套圈圈球板) 放在 0.82 等鼓/物件落下;DRIVE 走自己的物理 init
+          // SEQUENCE target 從上方 -200 起算,讓金魚明顯「從上往下掉」而非從中間出現
           const isTeamBoatInit = isPawnEnt && (ent.ball_binding || '').startsWith('team_');
           const isCatcherPawn = isPawnEnt && !isTeamBoatInit &&
             (ent.movement_logic?.atomic_action === 'PULSE' || ent.movement_logic?.atomic_action === 'NAVIGATE');
+          const isSequenceFallTarget = cfg.metadata.interaction_type === 'SEQUENCE' && ent.type === 'target';
           container.y = isTeamBoatInit
             ? app.screen.height * 0.92
-            : (isCatcherPawn ? app.screen.height * 0.82 : app.screen.height / 2);
+            : (isCatcherPawn ? app.screen.height * 0.82
+              : (isSequenceFallTarget ? -200 : app.screen.height / 2));
         }
         container.visible = true;
 
@@ -406,8 +411,9 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
            shape.fill({ color: 0xFF0000, alpha });
            shape.stroke({ width: 6, color: 0x000000, alpha: 1.0 });
         } else if (role === 'basket') {
-           // 藍色中空矩形 (籃子)
-           shape.rect(-60, -30, 120, 60);
+           // 藍色中空矩形 (籃子) — 尺寸放大到能視覺包住 target 黃球 (直徑 100)，
+           // 對齊邏輯依賴 container.y 一致即可（兩者都中心對稱繪製）。
+           shape.rect(-70, -55, 140, 110);
            shape.fill({ color: 0x0000FF, alpha: 0.2 });
            shape.stroke({ width: 6, color: 0x0000FF, alpha: 1.0 });
         } else if (ent.type === 'controllable_pawn') {
@@ -756,30 +762,48 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
              const action = ent.movement_logic?.atomic_action;
 
              if (getEntityRole(ent) === 'basket') {
+                 // 從 ball_binding(而非 layout)解析該 basket 對應的玩家壓力 — 新版 SEQUENCE_TURN 用 layout: center,
+                 // 不能再靠 layout==='left/right' 取 pIds[0/1]。直接複用 binding resolver 邏輯(支援 p{N}_both/left/right)。
                  const pIds = Object.keys(allPrs || {});
                  let playerPrs = { left: 0, right: 0 };
-                 const layout = getEntityLayout(ent);
-                 if (layout === 'left' && pIds.length > 0) {
-                     const pId = pIds[0];
-                     playerPrs = {
-                         left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
-                         right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
-                     };
-                 } else if (layout === 'right' && pIds.length > 1) {
-                     const pId = pIds[1];
-                     playerPrs = {
-                         left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
-                         right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
-                     };
+                 const binding = ent.ball_binding;
+                 const bMatch = binding ? binding.match(/^p(\d+)_(left|right|both)$/) : null;
+                 if (bMatch) {
+                     const idx = parseInt(bMatch[1], 10) - 1;
+                     if (idx >= 0 && idx < pIds.length) {
+                         const pId = pIds[idx];
+                         playerPrs = {
+                             left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
+                             right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
+                         };
+                     }
                  }
 
                  const threshold = 0.2;
                  const leftActive = playerPrs.left > threshold;
                  const rightActive = playerPrs.right > threshold;
+                 const avgActVal = (playerPrs.left + playerPrs.right) / 2;
 
+                 // SEQUENCE 模式:設 hasFired 旗標讓 SCORE_HIT 碰撞防呆生效(必須握壓才算撈到)
+                 // hasFired 在握壓 >= 0.2 時設 true,放鬆 < 0.08 重置(配合 SEQUENCE atomic_action 設計)
+                 if (cfg.metadata.interaction_type === 'SEQUENCE') {
+                     if (!entityPhysicsRef.current[ent.id]) {
+                         entityPhysicsRef.current[ent.id] = { vy: 0, vx: 0, lastY: container.y, lastX: container.x, hasFired: false };
+                     }
+                     const bp = entityPhysicsRef.current[ent.id];
+                     if (avgActVal >= 0.2 && !bp.hasFired) {
+                         bp.hasFired = true;
+                         gsap.killTweensOf(container.scale);
+                         gsap.to(container.scale, { x: 1.5, y: 1.5, duration: 0.15, yoyo: true, repeat: 1, overwrite: 'auto', onComplete: () => container.scale.set(1, 1) });
+                     } else if (avgActVal < 0.08 && bp.hasFired) {
+                         bp.hasFired = false;
+                     }
+                     continue; // basket 在 SEQUENCE 模式不需走 atomic_action,只需 hasFired
+                 }
+
+                 // 非 SEQUENCE 模式:沿用原本的 scale/rotation 視覺回饋
                  if (leftActive && rightActive) {
-                     const avg = (playerPrs.left + playerPrs.right) / 2;
-                     container.scale.set(1 + avg * 0.8);
+                     container.scale.set(1 + avgActVal * 0.8);
                      container.rotation += (0 - container.rotation) * 0.2;
                  } else if (leftActive) {
                      container.scale.set(1 + (container.scale.x - 1) * 0.8);
@@ -835,9 +859,12 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
              const phys = entityPhysicsRef.current[ent.id];
 
              if (ent.movement_logic) {
-                 const action = ent.movement_logic.atomic_action;
+                 // SEQUENCE 模式下強制 controllable_pawn 使用 SEQUENCE atomic_action,
+                 // 避免 AI 誤寫 PULSE 導致 basket 對同 sector target 施加向上衝量(視覺上 target 會被彈飛/亂跳)。
+                 const isSequencePawn = cfg.metadata.interaction_type === 'SEQUENCE' && ent.type === 'controllable_pawn';
+                 const action = isSequencePawn ? 'SEQUENCE' : ent.movement_logic.atomic_action;
                  const axis = ent.movement_logic.axis;
-                 
+
                  // --- Binding resolver ---
                  // 新格式: "p{N}_{left|right|both}" 例: "p3_left" = 第 3 位玩家左手
                  // 舊格式相容: "ball_1"/"p1"/"player_1" → 該玩家雙手平均;
@@ -884,8 +911,12 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                                  right: allPrs![pId].right / (mvcR || 1.0),
                              };
                              handMode = m[2] as 'left' | 'right' | 'both';
+                         } else {
+                             // 索引超界(綁定指向未連線玩家) → 顯式給 0 壓力,
+                             // 避免 fallback 到 normalizedPrs 讓 P2 basket 偷讀 P1 sensor 造成「P2 壓 → 兩框都變大」。
+                             entPrs = { left: 0, right: 0 };
+                             handMode = m[2] as 'left' | 'right' | 'both';
                          }
-                         // 索引超界 → 沿用 normalizedPrs(避免 4 人配置在 2 人 session 誤控別人)
                      } else {
                          // 舊格式: 玩家編號(ball_N / p{N} / player_N)
                          const legacyP = binding.match(/^(?:ball|p|player)_?(\d+)$/);
@@ -970,8 +1001,8 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                          container.scale.set(1 + actVal * 2);
                      }
                  } else if (action === 'PULSE') {
-                     const threshold = 0.6;
-                     const requireResetThreshold = 0.15;
+                     const threshold = 0.4;
+                     const requireResetThreshold = 0.1;
 
                      // Require Reset Logic for Burst
                      if (actVal > threshold && !phys.hasFired) {
@@ -1043,11 +1074,11 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                          container.y = lerp(container.y, app.screen.height / 2, 0.25);
                      }
                  } else if (action === 'SEQUENCE' && isPawn) {
-                     const threshold = 0.5;
-                     const requireResetThreshold = 0.15;
-                     if (actVal > threshold && !phys.hasFired) {
+                     // 長輩握力較弱,門檻 0.2 + 用 >= 確保最低握壓也能觸發。
+                     const threshold = 0.2;
+                     const requireResetThreshold = 0.08;
+                     if (actVal >= threshold && !phys.hasFired) {
                          phys.hasFired = true;
-                         // 捏的瞬間放大，提示玩家已出力
                          gsap.to(container.scale, { x: 1.5, y: 1.5, duration: 0.15, yoyo: true, repeat: 1 });
                      } else if (actVal < requireResetThreshold && phys.hasFired) {
                          phys.hasFired = false;
@@ -1130,34 +1161,19 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                          container.scale.set(ballScaleRef.current[ent.id] ?? 0.5);
                      } else {
                          // 其他模式：等速下墜 + 從上方重生
-                         // SEQUENCE 模式刻意放慢，給玩家足夠時間看清楚下一步該誰接
-                         const baseFallSpeed = cfg.metadata.interaction_type === 'SEQUENCE' ? 100 : 180;
-                         // PULSE 衝量會把 vy 設為負(向上)。若仍是負，套重力讓它自然落回；
-                         // 落回 baseFallSpeed 後就回到等速下墜，避免無限加速。
-                         if (phys.vy === undefined || phys.vy >= 0) {
-                             phys.vy = baseFallSpeed;
-                         } else {
-                             const gravity = 600;
-                             phys.vy = Math.min(phys.vy + gravity * deltaSec, baseFallSpeed);
-                         }
-                         phys.lastY += phys.vy * deltaSec;
-
-                         // SEQUENCE 模式：
-                         //   單一 target → X 跟 sequenceStep 在左右交替（記憶輪替訓練）
-                         //   多 target  → 各 target 鎖在自己 sector 的欄位（多重目標混淆訓練,3-4 人由 getLayoutX 自動分欄）
                          const isSequenceTarget = cfg.metadata.interaction_type === 'SEQUENCE' && ent.type === 'target';
                          const targetCount = cfg.entities.filter(e => e.type === 'target').length;
                          const targetSector = getEntitySector(ent);
                          const hasOwnSector = targetSector === 'p1' || targetSector === 'p2' || targetSector === 'p3' || targetSector === 'p4';
                          const seqPlayerCount = cfg.metadata.player_count ?? 2;
+                         const isMultiTargetSequence = isSequenceTarget && targetCount > 1 && hasOwnSector;
 
+                         // 計算欄位 X(下方落下邏輯與顯示都需要)
                          let sequenceTargetX: number;
-                         if (isSequenceTarget && targetCount > 1 && hasOwnSector) {
+                         if (isMultiTargetSequence) {
                              if (seqPlayerCount >= 3) {
-                                 // 3-4 人:用欄位中心
-                                 sequenceTargetX = getLayoutX(ent, app.screen.width, seqPlayerCount);
+                                 sequenceTargetX = getLayoutX({ ...ent, layout: 'center' }, app.screen.width, seqPlayerCount);
                              } else {
-                                 // 2 人:沿用 p1=25%, p2=75%
                                  sequenceTargetX = targetSector === 'p2'
                                      ? app.screen.width * 0.75
                                      : app.screen.width * 0.25;
@@ -1168,13 +1184,40 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                                  : app.screen.width * 0.25;
                          }
 
+                         // 輪替顯示:多目標 SEQUENCE 模式下,只顯示與當前 step 匹配 sector 的 target,
+                         // 不在輪次的金魚停在頂端待機(避免「同時掉下、同時搶接」的混亂視覺)。
+                         if (isMultiTargetSequence) {
+                             const currentStepSector = `p${sequenceStepRef.current}`;
+                             const isMyTurn = targetSector === currentStepSector;
+                             container.visible = isMyTurn;
+                             if (!isMyTurn) {
+                                 phys.lastY = -200;
+                                 phys.vy = 0;
+                                 phys.lastX = sequenceTargetX;
+                                 container.y = phys.lastY;
+                                 container.x = phys.lastX;
+                                 continue;
+                             }
+                         }
+
+                         // SEQUENCE 模式刻意放慢,給玩家足夠時間看清楚下一步該誰接
+                         const baseFallSpeed = cfg.metadata.interaction_type === 'SEQUENCE' ? 100 : 180;
+                         // PULSE 衝量會把 vy 設為負(向上)。若仍是負,套重力讓它自然落回;
+                         // 落回 baseFallSpeed 後就回到等速下墜,避免無限加速。
+                         if (phys.vy === undefined || phys.vy >= 0) {
+                             phys.vy = baseFallSpeed;
+                         } else {
+                             const gravity = 600;
+                             phys.vy = Math.min(phys.vy + gravity * deltaSec, baseFallSpeed);
+                         }
+                         phys.lastY += phys.vy * deltaSec;
+
                          if (phys.lastY > app.screen.height + 150) {
                              phys.lastY = -200;
                              phys.lastX = isSequenceTarget ? sequenceTargetX : getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
                          }
 
                          if (isSequenceTarget) {
-                             // 平滑滑向目標 X，避免接到後瞬間瞬移
                              phys.lastX = lerp(phys.lastX, sequenceTargetX, 0.08);
                          }
 
@@ -1315,35 +1358,34 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                const avgPressure = (normalizedPrs.left + normalizedPrs.right) / 2;
 
                // --- 針對接物籃 (basket) 的專門壓力檢查：若未出力，則不觸發接取！ ---
+               // 改用 ball_binding 解析(layout: center 已不再帶資訊),配合 basket 區塊維護的 phys.hasFired
                const pawnEnt = entA.type === 'controllable_pawn' ? entA : (entB.type === 'controllable_pawn' ? entB : null);
                const pawnEntLayout = pawnEnt ? getEntityLayout(pawnEnt) : 'center';
                if (pawnEnt && getEntityRole(pawnEnt) === 'basket') {
                    const pIds = Object.keys(allPrs || {});
-                   let pickerPrs = normalizedPrs;
-                   if (pawnEntLayout === 'left' && pIds.length > 0) {
-                       const pId = pIds[0];
-                       pickerPrs = {
-                           left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
-                           right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
-                       };
-                   } else if (pawnEntLayout === 'right' && pIds.length > 1) {
-                       const pId = pIds[1];
-                       pickerPrs = {
-                           left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
-                           right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
-                       };
+                   const pawnBinding = pawnEnt.ball_binding;
+                   const bm = pawnBinding ? pawnBinding.match(/^p(\d+)_(left|right|both)$/) : null;
+                   let pickerPrs = { left: 0, right: 0 };
+                   if (bm) {
+                       const idx = parseInt(bm[1], 10) - 1;
+                       if (idx >= 0 && idx < pIds.length) {
+                           const pId = pIds[idx];
+                           pickerPrs = {
+                               left: (allPrs![pId]?.left ?? 0) / (mvcL || 1.0),
+                               right: (allPrs![pId]?.right ?? 0) / (mvcR || 1.0)
+                           };
+                       }
                    }
-
-                   // 任一手或雙手皆可觸發接取（與視覺邏輯一致）
+                   // 任一手或雙手皆可觸發接取
                    const maxHand = Math.max(pickerPrs.left, pickerPrs.right);
                    if (maxHand < 0.2) {
-                       return; // 若雙手都未達門檻，視為沒接，香菇穿透不觸發碰撞。
+                       return;
                    }
                }
 
                // --- PULSE-mode paddle 必須處於「已擊發」狀態才算碰撞 ---
                // 不擋的話,鼓自然落到槌子位置就會觸發 SCORE_HIT(球都不握分數也增加)。
-               // phys.hasFired 由 PULSE 分支管理:壓力 > 0.6 設 true,< 0.15 重置為 false。
+               // phys.hasFired 由 PULSE 分支管理:壓力 > 0.4 設 true,< 0.1 重置為 false。
                if (pawnEnt && getEntityRole(pawnEnt) === 'paddle' &&
                    cfg.metadata.interaction_type === 'PULSE') {
                    const pawnPhys = entityPhysicsRef.current[pawnEnt.id];
@@ -1366,13 +1408,21 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                            return;
                        }
                    } else {
-                       // 單一目標：依輪替燈號限制
-                       if (sequenceStepRef.current === 1 && pawnEntLayout === 'right') {
-                           return; // 左燈亮時，右邊的人不能接金魚
+                       // 單一目標：依輪替燈號限制 — 用 sector 判定(不再靠 layout,因為新版 AI 都用 layout: center)
+                       const pawnSec = getEntitySector(pawnEnt);
+                       if (sequenceStepRef.current === 1 && pawnSec === 'p2') {
+                           return; // P1 燈亮時,P2 basket 不能接金魚
                        }
-                       if (sequenceStepRef.current === 2 && pawnEntLayout === 'left') {
-                           return; // 右燈亮時，左邊的人不能接金魚
+                       if (sequenceStepRef.current === 2 && pawnSec === 'p1') {
+                           return; // P2 燈亮時,P1 basket 不能接金魚
                        }
+                   }
+
+                   // SEQUENCE 模式必須「主動握壓」才算撈到 — 由 SEQUENCE atomic_action 維護的 phys.hasFired 旗標(>0.5 觸發、<0.15 重置)。
+                   // 沒按壓就掉到框上不予計分,讓玩家真的「撈」而不是被動接住。
+                   const pawnPhys = entityPhysicsRef.current[pawnEnt.id];
+                   if (!pawnPhys?.hasFired) {
+                       return;
                    }
                }
 
@@ -1426,6 +1476,16 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
                             if (sectors.has('p4')) scoreRefs.current.p4 += 1;
                             gsap.to(entA.scale, { x: 1.1, y: 1.1, duration: 0.1, yoyo: true, repeat: 1 });
                             gsap.to(entB.scale, { x: 1.1, y: 1.1, duration: 0.1, yoyo: true, repeat: 1 });
+
+                            // SEQUENCE 模式撈到後,target 立刻重生回頂端(避免「一魚兩吃」— 同一條魚在
+                            // 視覺上 lerp 到對方欄位繼續被撈)。多目標模式由 visibility 邏輯接手隱藏。
+                            if (cfg.metadata.interaction_type === 'SEQUENCE') {
+                                const targetEntInScore = entA.type === 'target' ? entA : (entB.type === 'target' ? entB : null);
+                                if (targetEntInScore && entityPhysicsRef.current[targetEntInScore.id]) {
+                                    entityPhysicsRef.current[targetEntInScore.id].lastY = -200;
+                                    entityPhysicsRef.current[targetEntInScore.id].vy = 0;
+                                }
+                            }
                             // 太鼓同步:擊中即標記 consumed,本拍剩餘時間隱藏該 drum
                             if (taikoSyncRef.current.initialized) {
                                 const targetEntInPair = entA.type === 'target' ? entA : (entB.type === 'target' ? entB : null);

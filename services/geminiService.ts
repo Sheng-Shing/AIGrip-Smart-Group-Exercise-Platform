@@ -24,10 +24,14 @@ const SYSTEM_INSTRUCTION = `你是一位精通「團康活動邏輯」與「物�
 
 ### 二、 嚴格規範
 1. **硬體限制**：目前版本僅使用壓力感測 (PRESSURE)，暫不使用陀螺儀。
-2. **抑制控制 (Inhibition)**：必須包含「錯誤顏色扣分」與「障礙物閃避」邏輯。
+2. **抑制控制 (Inhibition)**：可包含「錯誤顏色扣分」與「障礙物閃避」邏輯,但**僅限於特定機制**。
    - 閃避模式：玩家必須維持壓力 < 0.05 (Reset 狀態) 才能安全穿透。
-   - **SEQUENCE 模式硬性規範**：entities 陣列**必須至少包含 1 個 \`type: "obstacle"\` 實體**，且 collision_handlers 必須對該 obstacle 與 controllable_pawn 之間提供一條 \`penalty_logic\` 不為 \`"NONE"\` 的處理(建議使用 \`"HAPTIC_LONG_VIBRATE"\` 作為壓力陷阱,訓練等待輪次時的專注力)。pawn-obstacle 碰撞不受 SEQUENCE 輪替鎖限制,penalty 會正常觸發。
-   - **多重目標混淆(SEQUENCE 模式選用)**：可同時放 ≥2 個 \`type: target\`，分別設 \`sector: "p1"\` / \`sector: "p2"\`，引擎會自動讓各目標固定在所屬玩家側邊掉落，並要求 sector 匹配才算分(撈錯側自動忽略)。此模式下 \`sequence_pattern\` 的輪替燈號失效，改用 sector 匹配判定。
+   - **obstacle 使用規範(嚴格遵守)**:
+     - ✅ **FREEZE_INHIBITION 機制**(關鍵詞:木頭人、紅綠燈、freeze、Simon Says 反向):可加入 \`type: "obstacle"\`,配合 \`required_state: "pressure < 0.05"\` 做壓力陷阱。
+     - ✅ **DUAL_TASK 機制**(老鷹捉小雞、邊走邊接):必須有 obstacle(左手躲) + target(右手接)。
+     - ❌ **SEQUENCE_TURN 機制**(撈金魚、接龍、大風吹、踩階梯、輪流):**嚴禁生成任何 \`type: "obstacle"\` 實體**。此機制只能有 controllable_pawn(籃子/網)與 target(金魚/物件)兩種,不允許 obstacle(石頭、礁石、水花、障礙等任何包裝)。違反會破壞撈金魚的玩法純度。
+     - ❌ **FALL_CATCH / NAVIGATE_AIM / TEAM_COOP_RACE / GROUP_RHYTHM**:預設不含 obstacle,除非使用者明確要求才加。
+   - **多重目標混淆(SEQUENCE_TURN 機制選用)**：可同時放 ≥2 個 \`type: target\`，分別設 \`sector: "p1"\` / \`sector: "p2"\`，引擎會自動讓各目標固定在所屬玩家側邊掉落，並要求 sector 匹配才算分(撈錯側自動忽略)。此模式下 \`sequence_pattern\` 的輪替燈號失效，改用 sector 匹配判定。
 3. **玩家人數與輸入裝置**：
    - **硬體配置**:每位玩家配備 **2 顆壓力球**(代表左、右手),系統最多支援 4 位玩家(共 8 路壓力輸入)。
    - 由使用者需求中的人數推斷 \`player_count\`（沒明寫就預設 1）。常見關鍵詞：「雙人 / 兩人 / 協力 / 對戰」→ 2,「三人」→ 3,「四人 / 兩隊」→ 4,「單人 / 我」→ 1。
@@ -81,6 +85,7 @@ const SYSTEM_INSTRUCTION = `你是一位精通「團康活動邏輯」與「物�
 - interaction_type: \`SEQUENCE\`
 - 機制: 已內建,sequence_pattern 必填(規則 #8),引擎自動處理燈號輪替與 target 位置切換。
 - ball_binding: 多人時 \`"p{N}_both"\` 接;進階可拆「左手接奇位、右手接偶位」用 \`"p{N}_left"\` / \`"p{N}_right"\`。
+- ⚠️ **嚴禁 obstacle**: 此模板下 entities 陣列**只能有兩種類型** — \`controllable_pawn\`(籃子/網/碗)與 \`target\`(金魚/燈號/題目)。**不可加入 \`type: "obstacle"\` 實體**(石頭、礁石、水花、雜物、誤觸物等任何包裝形式都禁止)。AI 不要自作主張加抑制控制元素,規則 #2 的 obstacle 規範不適用於本模板。
 
 **F 精準操控 (Fine Motor / 套圈圈類)**
 - 關鍵詞: 套圈圈、丟沙包、投籃、瞄準、左右移動接
@@ -279,6 +284,31 @@ export interface ConfirmedMechanic {
  * 把 manifest 中該機制的關鍵 spec 渲染成 prompt 片段，
  * 直接告訴 AI:「不用猜了,就用這個機制」。
  */
+// 每個機制的硬性禁令(會覆蓋 SYSTEM_INSTRUCTION 中的通用規則)
+const MECHANIC_FORBIDS: Record<string, string[]> = {
+  SEQUENCE_TURN: [
+    "嚴禁生成任何 `type: \"obstacle\"` 實體(石頭、礁石、水花、雜物、誤觸物等任何包裝都不行)",
+    "entities 陣列**只能**包含 `controllable_pawn`(籃子/網/碗)與 `target`(金魚/燈號/題目)兩種類型",
+    "collision_handlers 中不可出現 `penalty_logic` 為 `HAPTIC_LONG_VIBRATE` / `DEDUCT_SCORE` 的條目(此機制無懲罰邏輯)",
+    "不要自作主張加入抑制控制(inhibition_control)元素 — 此機制只訓練輪次等待與短期記憶",
+    "**role 欄位嚴格規範**: controllable_pawn 一律用 `role: \"basket\"`(渲染為藍框接物器);target 一律用 `role: \"decoration\"`(會被引擎渲染為黃色圓圈金魚/題目燈)。**不可用 `role: \"paddle\"` / `role: \"mushroom\"`** — 那些 role 會走錯渲染分支,造成視覺與引擎邏輯對不上。",
+    "**layout 欄位建議用 `\"center\"`**(basket 與 target 都是):引擎會自動以 sector 分欄,layout 不影響輪替判分。寫 left/right 引擎會忽略並 snap 到欄位中心,但寫 center 最清晰。",
+    "**controllable_pawn 的 `movement_logic.atomic_action` 必須為 `\"SEQUENCE\"`**: 不可寫 PULSE / DRIVE / NAVIGATE。PULSE 會讓 basket 對同 sector target 施加向上衝量,造成「黃球在兩框間彈飛」的錯誤行為;DRIVE/NAVIGATE 會讓 basket 移動,破壞「靜態接物器」設定。",
+  ],
+  FALL_CATCH: [
+    "預設不加入 obstacle,除非使用者明確要求「閃避 / 避開 / 不要接到 X」",
+  ],
+  NAVIGATE_AIM: [
+    "預設不加入 obstacle,除非使用者明確要求閃避邏輯",
+  ],
+  TEAM_COOP_RACE: [
+    "嚴禁加入 obstacle,本機制只有兩隊船/車與兩條 finish_line",
+  ],
+  GROUP_RHYTHM: [
+    "不要混用 `sector: \"shared\"` 的 target(會脫離同步分組);共用障礙物可保 layout=center",
+  ],
+};
+
 const renderConfirmedMechanicGuide = (cm: ConfirmedMechanic): string => {
   const spec = MECHANICS.find((m) => m.id === cm.mechanic_id);
   if (!spec) return "";
@@ -294,6 +324,11 @@ const renderConfirmedMechanicGuide = (cm: ConfirmedMechanic): string => {
     ? spec.interaction_type
     : (spec as any).interaction_type_options?.[0];
 
+  const forbids = MECHANIC_FORBIDS[spec.id];
+  const forbidBlock = forbids && forbids.length > 0
+    ? `\n\n## ⛔ 本機制專屬硬性禁令(優先於 SYSTEM_INSTRUCTION 中的通用規則)\n${forbids.map((f) => `- ${f}`).join("\n")}`
+    : "";
+
   return `
 ## 🎯 [使用者已確認玩法] 請嚴格遵守以下設定
 
@@ -306,7 +341,7 @@ const renderConfirmedMechanicGuide = (cm: ConfirmedMechanic): string => {
 ${spec.mechanic_summary}
 
 ## 引擎特性(必須遵守)
-${features}${requiredMeta}${canonicalEntities}
+${features}${requiredMeta}${canonicalEntities}${forbidBlock}
 
 ## 注意
 - 不要選擇其他 interaction_type 或機制,使用者已確認用這個。
