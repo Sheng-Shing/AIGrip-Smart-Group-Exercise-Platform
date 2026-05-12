@@ -376,8 +376,8 @@ const GameView: React.FC<GameViewProps> = ({ config, pressure, pressures, isActi
         const isPawnEnt = ent.type === 'controllable_pawn';
 
         if (isMixedMode && isPawnEnt) {
-          // MIXED: stack paddles vertically, P1 top / P2 bottom
-          container.x = app.screen.width / 2;
+          // MIXED: X 跟著 sector + layout 走(多人 DUAL_TASK 需要分欄);Y 用 getMixedPawnY 依玩家 slot 錯開
+          container.x = getLayoutX(ent, app.screen.width, cfg.metadata.player_count ?? 1);
           container.y = getMixedPawnY(getPawnPlayerSlot(ent), app.screen.height);
         } else if (cfg.metadata.interaction_type === 'SEQUENCE' && isPawnEnt) {
           // SEQUENCE: 所有 controllable_pawn(籃子/網/接物器)放在螢幕下方 75%、X 鎖在 sector 欄位中心,
